@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.codex/
+.worktrees/
+target/
+*.log
+*.tmp
+*.swp
+*~
