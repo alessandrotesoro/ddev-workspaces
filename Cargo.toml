@@ -1,0 +1,16 @@
+[package]
+name = "ddev-workspaces"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A conservative local Git worktree and DDEV workspace manager"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.6.6", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+toml = { version = "1.1.4", default-features = false, features = ["std", "serde", "parse"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
