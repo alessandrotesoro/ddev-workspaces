@@ -8,7 +8,6 @@ use crate::command::{CommandRequest, CommandRunner, ToolError, ToolResult};
 pub struct GitRepository {
     pub root: PathBuf,
     pub common_dir: PathBuf,
-    pub git_dir: PathBuf,
     pub main_worktree: PathBuf,
 }
 
@@ -32,8 +31,6 @@ pub struct SourceDiagnostics {
     pub issues: Vec<String>,
     pub warnings: Vec<String>,
     pub worktrees: Vec<WorktreeRecord>,
-    pub tracked_paths: Vec<String>,
-    pub lfs_paths: Vec<String>,
 }
 
 impl SourceDiagnostics {
@@ -67,8 +64,6 @@ impl GitRepository {
             trim_one_line(&common_output)?,
             "common Git directory",
         )?;
-        let git_output = run_git(runner, &root, ["rev-parse", "--git-dir"])?;
-        let git_dir = resolve_git_path(&root, trim_one_line(&git_output)?, "Git directory")?;
         let main_worktree = common_dir
             .parent()
             .map(Path::to_path_buf)
@@ -77,7 +72,6 @@ impl GitRepository {
         Ok(Self {
             root,
             common_dir,
-            git_dir,
             main_worktree,
         })
     }
@@ -297,6 +291,47 @@ impl GitRepository {
         }
     }
 
+    pub fn require_stage_zero_file<R: CommandRunner>(
+        &self,
+        path: &Path,
+        runner: &mut R,
+    ) -> ToolResult<()> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            ToolError::new(format!(
+                "declared template {} is outside the Git worktree",
+                path.display()
+            ))
+        })?;
+        let relative = relative.to_str().ok_or_else(|| {
+            ToolError::new(format!(
+                "declared template {} cannot be represented as a Git path",
+                path.display()
+            ))
+        })?;
+        let output = run_git(
+            runner,
+            &self.root,
+            [
+                "ls-files".to_owned(),
+                "--stage".to_owned(),
+                "-z".to_owned(),
+                "--".to_owned(),
+                relative.to_owned(),
+            ],
+        )?;
+        let tracked = parse_tracked_paths(&output);
+        if tracked
+            .iter()
+            .any(|entry| entry.stage == 0 && entry.path == relative)
+        {
+            return Ok(());
+        }
+        Err(ToolError::new(format!(
+            "declared template {} must be a stage-zero tracked Git file; untracked templates are not accepted",
+            path.display()
+        )))
+    }
+
     pub fn remove_worktree<R: CommandRunner>(&self, path: &Path, runner: &mut R) -> ToolResult<()> {
         let request = git_request(
             &self.root,
@@ -381,7 +416,7 @@ impl GitRepository {
 
         let tracked =
             parse_tracked_paths(&run_git(runner, &self.root, ["ls-files", "--stage", "-z"])?);
-        diagnostics.tracked_paths = tracked
+        let tracked_paths: Vec<String> = tracked
             .iter()
             .filter(|entry| entry.stage == 0)
             .map(|entry| entry.path.clone())
@@ -431,8 +466,7 @@ impl GitRepository {
             diagnostics.issues.push("repository is detached".to_owned());
         }
 
-        let lfs_paths = self.lfs_paths(&diagnostics.tracked_paths, runner)?;
-        diagnostics.lfs_paths = lfs_paths.clone();
+        let lfs_paths = self.lfs_paths(&tracked_paths, runner)?;
         if !lfs_paths.is_empty() {
             let lfs = run_git_allow_failure(runner, &self.root, ["lfs", "version"])?;
             if !lfs.success() {
@@ -874,7 +908,6 @@ mod tests {
                 status: 0,
                 stdout: String::new(),
                 stderr: String::new(),
-                executed: true,
             }))
         }
     }
@@ -922,19 +955,39 @@ mod tests {
     }
 
     #[test]
+    fn template_stage_check_rejects_untracked_paths() {
+        let mut runner = FakeRunner {
+            responses: vec![CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }],
+        };
+        let repository = GitRepository {
+            root: PathBuf::from("/tmp/repo"),
+            common_dir: PathBuf::from("/tmp/repo/.git"),
+            main_worktree: PathBuf::from("/tmp/repo"),
+        };
+
+        let error = repository
+            .require_stage_zero_file(&repository.root.join(".env.example"), &mut runner)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stage-zero tracked Git file"));
+    }
+
+    #[test]
     fn failed_remote_query_is_sanitized() {
         let mut runner = FakeRunner {
             responses: vec![CommandOutput {
                 status: 128,
                 stdout: String::new(),
                 stderr: "ssh://secret@example.invalid/private".to_owned(),
-                executed: true,
             }],
         };
         let repository = GitRepository {
             root: PathBuf::from("/tmp/repo"),
             common_dir: PathBuf::from("/tmp/repo/.git"),
-            git_dir: PathBuf::from("/tmp/repo/.git"),
             main_worktree: PathBuf::from("/tmp/repo"),
         };
 

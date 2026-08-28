@@ -290,7 +290,6 @@ mod tests {
                 status: 0,
                 stdout: String::new(),
                 stderr: String::new(),
-                executed: true,
             }))
         }
     }
@@ -357,7 +356,6 @@ mod tests {
                 status: 0,
                 stdout: "{not-json".to_owned(),
                 stderr: String::new(),
-                executed: true,
             }],
         };
 

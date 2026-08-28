@@ -149,6 +149,22 @@ fn list_ddev_identity_recomputes_source_only_status_without_scanning_other_repos
         &["create", "--source-only", "--base", "HEAD", "listed"],
     );
     assert!(created.status.success(), "{}", support::stderr(&created));
+    let workspace = repository.path().join(".worktrees/listed");
+    fs::write(
+        workspace.join("README.md"),
+        "committed after workspace creation\n",
+    )
+    .expect("workspace change");
+    assert!(
+        support::run_git(&workspace, &["add", "README.md"])
+            .status
+            .success()
+    );
+    assert!(
+        support::run_git(&workspace, &["commit", "-m", "advance workspace head"])
+            .status
+            .success()
+    );
 
     let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
     let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
@@ -201,6 +217,48 @@ fn doctor_on_a_linked_worktree_uses_the_manager_configuration() {
     assert!(doctor.status.success(), "{text}");
     assert!(text.contains("Configuration: READY"));
     assert!(text.ends_with("READY\n"));
+}
+
+#[test]
+fn doctor_revalidates_semantic_ownership_record() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n",
+    );
+    commit(repository.path(), "add ownership validation fixture");
+    let created = run_cli(
+        repository.path(),
+        &["create", "--source-only", "--base", "HEAD", "semantic"],
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let record_path = repository
+        .path()
+        .join(".git/ddev-workspaces/workspaces/semantic.toml");
+    let record = fs::read_to_string(&record_path).expect("ownership record");
+    let invalid_record = record
+        .lines()
+        .map(|line| {
+            if line.starts_with("base_sha = ") {
+                "base_sha = 'invalid'".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&record_path, format!("{invalid_record}\n")).expect("corrupted record");
+
+    let workspace = repository.path().join(".worktrees/semantic");
+    let workspace_value = workspace.to_str().expect("workspace path");
+    let doctor = run_cli(repository.path(), &["doctor", workspace_value]);
+    let text = format!("{}{}", stdout(&doctor), support::stderr(&doctor));
+
+    assert_eq!(doctor.status.code(), Some(1));
+    assert!(text.contains("Ownership: NOT READY"), "{text}");
+    assert!(text.contains("base SHA"), "{text}");
 }
 
 #[test]

@@ -154,7 +154,7 @@ fn runtime_readiness_is_rechecked_after_declared_commands() {
     let text = format!("{}{}", stdout(&output), support::stderr(&output));
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(text.contains("runtime readiness failed"));
+    assert!(text.contains("runtime readiness failed"), "{text}");
     assert!(!text.contains("Runtime: READY"));
     assert!(repository.path().join(".worktrees/removed").exists());
     assert!(
@@ -163,6 +163,28 @@ fn runtime_readiness_is_rechecked_after_declared_commands() {
             .join(".git/ddev-workspaces/workspaces/removed.toml")
             .exists()
     );
+}
+
+#[test]
+fn git_readiness_is_rechecked_after_declared_commands() {
+    let repository = init_repo();
+    write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[[commands]]\nlabel = 'remove tracked source'\ncwd = '.'\nargv = ['rm', 'README.md']\n",
+    );
+    commit(repository.path(), "add post-command Git fixture");
+
+    let output = run_cli(
+        repository.path(),
+        &["create", "--base", "HEAD", "git-check"],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text.contains("source verification failed"), "{text}");
+    assert!(text.contains("tracked path missing"), "{text}");
+    assert!(!text.contains("Runtime: READY"));
 }
 
 fn write_tracked_file(root: &std::path::Path, relative: &str, contents: &str) {

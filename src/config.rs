@@ -414,7 +414,6 @@ mod tests {
                 status: if self.ignored { 0 } else { 1 },
                 stdout: String::new(),
                 stderr: String::new(),
-                executed: true,
             })
         }
     }
