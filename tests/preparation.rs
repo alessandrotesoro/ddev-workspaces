@@ -46,6 +46,11 @@ fn source_only_skips_files_commands_and_ddev() {
 #[test]
 fn named_files_and_commands_produce_runtime_readiness() {
     let repository = init_repo();
+    fs::write(
+        repository.path().join(".gitignore"),
+        ".worktrees/\n.ddev/config.ddev-workspaces.yaml\n.env\nfirst-marker\nsecond-marker\n",
+    )
+    .expect("fixture ignore file");
     write_tracked_file(
         repository.path(),
         ".ddev-workspaces.toml",
@@ -66,6 +71,89 @@ fn named_files_and_commands_produce_runtime_readiness() {
     );
     assert!(workspace.join("first-marker").is_file());
     assert!(workspace.join("second-marker").is_file());
+}
+
+#[test]
+fn non_ignored_file_destinations_are_rejected_before_publication() {
+    let repository = init_repo();
+    write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[[files]]\nlabel = 'runtime configuration'\ndestination = 'runtime.conf'\ntemplate = 'runtime.conf.example'\n",
+    );
+    write_tracked_file(repository.path(), "runtime.conf.example", "runtime=true\n");
+    commit(repository.path(), "add non-ignored file fixture");
+
+    let output = run_cli(
+        repository.path(),
+        &["create", "--base", "HEAD", "non-ignored-file"],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+    let workspace = repository.path().join(".worktrees/non-ignored-file");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text.contains("is not ignored by Git"), "{text}");
+    assert!(!text.contains("Runtime: READY"));
+    assert!(!workspace.join("runtime.conf").exists());
+    assert!(workspace.exists());
+}
+
+#[test]
+fn non_ignored_command_outputs_prevent_create_and_list_from_reporting_ready() {
+    let repository = init_repo();
+    write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[[commands]]\nlabel = 'generate runtime configuration'\ncwd = '.'\nargv = ['touch', 'generated.conf']\n",
+    );
+    commit(repository.path(), "add non-ignored command fixture");
+
+    let created = run_cli(
+        repository.path(),
+        &["create", "--base", "HEAD", "non-ignored-command"],
+    );
+    let created_text = format!("{}{}", stdout(&created), support::stderr(&created));
+
+    assert_eq!(created.status.code(), Some(1));
+    assert!(created_text.contains("dirty or has untracked files"));
+    assert!(!created_text.contains("Runtime: READY"));
+
+    let listed = run_cli(repository.path(), &["list"]);
+    let listed_text = format!("{}{}", stdout(&listed), support::stderr(&listed));
+
+    assert_eq!(listed.status.code(), Some(1));
+    assert!(listed_text.contains("non-ignored-command: NOT READY"));
+    assert!(listed_text.contains("dirty or has untracked files"));
+}
+
+#[test]
+fn ignored_command_outputs_remain_ready_and_removable() {
+    let repository = init_repo();
+    write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[[commands]]\nlabel = 'generate ignored environment'\ncwd = '.'\nargv = ['touch', '.env']\n",
+    );
+    commit(repository.path(), "add ignored command fixture");
+
+    let created = run_cli(
+        repository.path(),
+        &["create", "--base", "HEAD", "ignored-command"],
+    );
+    let created_text = format!("{}{}", stdout(&created), support::stderr(&created));
+    assert!(created.status.success(), "{created_text}");
+
+    let listed = run_cli(repository.path(), &["list"]);
+    let listed_text = format!("{}{}", stdout(&listed), support::stderr(&listed));
+    assert!(listed.status.success(), "{listed_text}");
+    assert!(listed_text.contains("ignored-command: READY"));
+
+    let removed = run_cli(
+        repository.path(),
+        &["remove", "--confirm", "ignored-command", "ignored-command"],
+    );
+    let removed_text = format!("{}{}", stdout(&removed), support::stderr(&removed));
+    assert!(removed.status.success(), "{removed_text}");
 }
 
 #[test]
