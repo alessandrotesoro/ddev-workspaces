@@ -48,7 +48,13 @@ fn doctor(arguments: &ArgMatches) -> ToolResult<u8> {
         Ok(config) => {
             println!("Configuration: READY");
             let mut ready = true;
-            if let Some(record) = &managed_record {
+            if let Some((record_name, record)) = &managed_record {
+                if let Err(error) =
+                    verify_removal_target(&repository, &config, record_name, record, &mut runner)
+                {
+                    println!("Ownership: NOT READY — {error}");
+                    ready = false;
+                }
                 if let Some(reason) = runtime_precondition_failure(&config, &repository.root) {
                     println!("Runtime: NOT READY — {reason}");
                     ready = false;
@@ -64,7 +70,7 @@ fn doctor(arguments: &ArgMatches) -> ToolResult<u8> {
                         for warning in &inspection.warnings {
                             println!("DDEV: {warning}");
                         }
-                        if let Some(record) = &managed_record {
+                        if let Some((_, record)) = &managed_record {
                             match find_owned_ddev(&inspection.entries, &record.ddev_name, &app_root)
                             {
                                 Ok(Some(project)) => {
@@ -132,7 +138,9 @@ fn doctor(arguments: &ArgMatches) -> ToolResult<u8> {
     }
 }
 
-fn ownership_state_for_path(repository: &GitRepository) -> (Option<OwnershipRecord>, Vec<String>) {
+fn ownership_state_for_path(
+    repository: &GitRepository,
+) -> (Option<(String, OwnershipRecord)>, Vec<String>) {
     let entries = match state::list(&repository.common_dir) {
         Ok(entries) => entries,
         Err(error) => return (None, vec![error.to_string()]),
@@ -148,7 +156,7 @@ fn ownership_state_for_path(repository: &GitRepository) -> (Option<OwnershipReco
                         entry.name
                     ));
                 } else if Path::new(&record.worktree_path) == repository.root {
-                    managed_record = Some(record);
+                    managed_record = Some((entry.name, record));
                 }
             }
             Err(error) => issues.push(format!("record `{}` is invalid: {error}", entry.name)),
@@ -312,7 +320,7 @@ fn print_list_entry<R: CommandRunner>(
         );
         return false;
     }
-    let source = match worktree_repository.diagnose(Some(&record.base_sha), runner) {
+    let source = match worktree_repository.diagnose(None, runner) {
         Ok(source) => source,
         Err(error) => {
             println!("{}: NOT READY — {error}", entry.name);
@@ -519,8 +527,8 @@ fn create_after_reservation<R: CommandRunner>(
         return Ok(());
     }
 
-    prepare_files(project_config, workspace)?;
-    let ddev_project = if let Some(ddev_config) = &project_config.ddev {
+    prepare_files(project_config, workspace, &workspace_repository, runner)?;
+    let mut ddev_project = if let Some(ddev_config) = &project_config.ddev {
         let app_root = config::safe_join(workspace, &ddev_config.app_root)?;
         let inspection = ddev::list(runner, workspace)?;
         ddev::inspect_new_identity(&inspection, &record.ddev_name, &app_root)?;
@@ -541,6 +549,22 @@ fn create_after_reservation<R: CommandRunner>(
         None
     };
     run_declared_commands(project_config, workspace, runner)?;
+    let source = workspace_repository.diagnose(Some(&base.sha), runner)?;
+    if !source.ready() {
+        return Err(ToolError::new(format_source_failure(&source)));
+    }
+    for warning in &source.warnings {
+        println!("Cleanup report: {warning}");
+    }
+    if let Some(ddev_config) = &project_config.ddev {
+        let app_root = config::safe_join(workspace, &ddev_config.app_root)?;
+        let after_commands = ddev::list(runner, &app_root)?;
+        ddev_project = Some(ddev::require_ready_identity(
+            &after_commands,
+            &record.ddev_name,
+            &app_root,
+        )?);
+    }
     if let Some(reason) = runtime_precondition_failure(project_config, workspace) {
         return Err(ToolError::new(format!(
             "runtime readiness failed after declared commands: {reason}"
@@ -852,7 +876,12 @@ fn runtime_precondition_failure(config: &ProjectConfig, workspace: &Path) -> Opt
     None
 }
 
-fn prepare_files(project_config: &ProjectConfig, workspace: &Path) -> ToolResult<()> {
+fn prepare_files<R: CommandRunner>(
+    project_config: &ProjectConfig,
+    workspace: &Path,
+    workspace_repository: &GitRepository,
+    runner: &mut R,
+) -> ToolResult<()> {
     let mut planned = Vec::new();
     for file in &project_config.files {
         let destination = config::safe_join(workspace, &file.destination)?;
@@ -866,6 +895,7 @@ fn prepare_files(project_config: &ProjectConfig, workspace: &Path) -> ToolResult
         let source = match (&file.template, &file.source_env) {
             (Some(template), None) => {
                 let path = config::safe_join(workspace, template)?;
+                workspace_repository.require_stage_zero_file(&path, runner)?;
                 ensure_regular_file(&path, &file.label)?;
                 path
             }
@@ -884,32 +914,75 @@ fn prepare_files(project_config: &ProjectConfig, workspace: &Path) -> ToolResult
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut input = fs::File::open(&source).map_err(|error| {
-            ToolError::new(format!(
-                "file rule `{}` source could not be opened: {error}",
-                file.label
-            ))
-        })?;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination)
-            .map_err(|error| {
-                ToolError::new(format!(
-                    "file rule `{}` destination {} could not be created: {error}",
-                    file.label,
-                    destination.display()
-                ))
-            })?;
-        io::copy(&mut input, &mut output).map_err(|error| {
-            ToolError::new(format!("file rule `{}` copy failed: {error}", file.label))
-        })?;
-        output.sync_all()?;
-        if file.source_env.is_some() {
-            set_private_permissions(&destination)?;
-        }
+        copy_file_atomically(
+            &source,
+            &destination,
+            &file.label,
+            file.source_env.is_some(),
+        )?;
     }
     Ok(())
+}
+
+fn copy_file_atomically(
+    source: &Path,
+    destination: &Path,
+    label: &str,
+    private: bool,
+) -> ToolResult<()> {
+    let file_name = destination.file_name().ok_or_else(|| {
+        ToolError::new(format!(
+            "file rule `{label}` destination {} has no file name",
+            destination.display()
+        ))
+    })?;
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(".ddev-workspaces.tmp");
+    let temporary = destination.with_file_name(temporary_name);
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| {
+            ToolError::new(format!(
+                "file rule `{label}` temporary destination could not be created: {error}"
+            ))
+        })?;
+
+    let result: ToolResult<()> = (|| {
+        let mut input = fs::File::open(source).map_err(|error| {
+            ToolError::new(format!(
+                "file rule `{label}` source could not be opened: {error}"
+            ))
+        })?;
+        io::copy(&mut input, &mut output)
+            .map_err(|error| ToolError::new(format!("file rule `{label}` copy failed: {error}")))?;
+        output.sync_all().map_err(|error| {
+            ToolError::new(format!(
+                "file rule `{label}` copy could not be synced: {error}"
+            ))
+        })?;
+        if private {
+            set_private_permissions(&temporary)?;
+        }
+        // Publish the complete same-directory file without replacing an existing destination.
+        fs::hard_link(&temporary, destination).map_err(|error| {
+            ToolError::new(format!(
+                "file rule `{label}` destination {} could not be published: {error}",
+                destination.display()
+            ))
+        })?;
+        fs::remove_file(&temporary).map_err(|error| {
+            ToolError::new(format!(
+                "file rule `{label}` temporary destination could not be removed: {error}"
+            ))
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn run_declared_commands<R: CommandRunner>(

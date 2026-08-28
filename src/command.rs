@@ -119,7 +119,6 @@ pub struct CommandOutput {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
-    pub executed: bool,
 }
 
 impl CommandOutput {
@@ -132,7 +131,6 @@ impl CommandOutput {
             status: 0,
             stdout: String::new(),
             stderr: String::new(),
-            executed: false,
         }
     }
 }
@@ -144,22 +142,17 @@ pub trait CommandRunner {
 #[derive(Debug, Default)]
 pub struct RealCommandRunner {
     pub dry_run: bool,
-    pub planned: Vec<CommandRequest>,
 }
 
 impl RealCommandRunner {
     pub fn new(dry_run: bool) -> Self {
-        Self {
-            dry_run,
-            planned: Vec::new(),
-        }
+        Self { dry_run }
     }
 }
 
 impl CommandRunner for RealCommandRunner {
     fn run(&mut self, request: &CommandRequest) -> ToolResult<CommandOutput> {
         if self.dry_run && request.mutating {
-            self.planned.push(request.clone());
             return Ok(CommandOutput::dry_run());
         }
 
@@ -187,7 +180,6 @@ impl CommandRunner for RealCommandRunner {
                 status: status.code().unwrap_or(1),
                 stdout: String::new(),
                 stderr: String::new(),
-                executed: true,
             });
         }
         let output = command
@@ -198,7 +190,6 @@ impl CommandRunner for RealCommandRunner {
             status: output.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            executed: true,
         })
     }
 }
@@ -249,15 +240,14 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_runner_records_mutation_without_executing_it() {
+    fn dry_run_runner_skips_mutation_without_executing_it() {
         let mut runner = RealCommandRunner::new(true);
         let request = CommandRequest::new("definitely-not-a-command", std::iter::empty::<String>())
             .mutating();
 
         let output = runner.run(&request).expect("dry-run should succeed");
 
-        assert!(!output.executed);
-        assert_eq!(runner.planned, vec![request]);
+        assert!(output.success());
     }
 
     #[test]
