@@ -226,23 +226,18 @@ pub fn validate_name(field: &str, value: &str) -> ToolResult<()> {
 }
 
 pub fn validate_repository_relative(field: &str, value: &str) -> ToolResult<()> {
-    validate_relative(field, value, true)
+    validate_relative(field, value)
 }
 
 pub fn validate_workspace_relative(field: &str, value: &str) -> ToolResult<()> {
-    validate_relative(field, value, true)
+    validate_relative(field, value)
 }
 
-fn validate_relative(field: &str, value: &str, allow_dot: bool) -> ToolResult<()> {
+fn validate_relative(field: &str, value: &str) -> ToolResult<()> {
     let path = Path::new(value);
     if value.is_empty() || path.is_absolute() {
         return Err(ToolError::new(format!(
             "configuration field `{field}` must be a non-empty relative path"
-        )));
-    }
-    if !allow_dot && value == "." {
-        return Err(ToolError::new(format!(
-            "configuration field `{field}` may not be `.`"
         )));
     }
     let mut depth = 0usize;
@@ -263,7 +258,7 @@ fn validate_relative(field: &str, value: &str, allow_dot: bool) -> ToolResult<()
             }
         }
     }
-    if depth == 0 && !(allow_dot && value == ".") {
+    if depth == 0 && value != "." {
         return Err(ToolError::new(format!(
             "configuration field `{field}` must name a path"
         )));

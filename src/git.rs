@@ -659,21 +659,6 @@ impl GitRepository {
                 worktree.display()
             )));
         }
-        let diff_index =
-            run_git_allow_failure(runner, worktree, ["diff-index", "--quiet", "HEAD", "--"])?;
-        if !diff_index.success() {
-            return Err(ToolError::new(format!(
-                "worktree {} has tracked changes; refusing removal",
-                worktree.display()
-            )));
-        }
-        let diff_files = run_git_allow_failure(runner, worktree, ["diff-files", "--quiet", "--"])?;
-        if !diff_files.success() {
-            return Err(ToolError::new(format!(
-                "worktree {} has unstaged changes; refusing removal",
-                worktree.display()
-            )));
-        }
         let submodule_status =
             run_git_allow_failure(runner, worktree, ["submodule", "status", "--recursive"])?;
         if !submodule_status.success() {

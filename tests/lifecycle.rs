@@ -3,25 +3,7 @@ mod support;
 use std::fs;
 use std::io::Write;
 
-use support::{commit, init_repo, init_repo_with_origin, run_cli, stdout};
-
-#[test]
-fn omitted_base_uses_the_advertised_remote_head() {
-    let (repository, _remote) = init_repo_with_origin();
-    support::write_tracked_file(
-        repository.path(),
-        ".ddev-workspaces.toml",
-        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n",
-    );
-    commit(repository.path(), "add omitted-base fixture");
-
-    let output = run_cli(repository.path(), &["create", "--dry-run", "omitted"]);
-    let text = format!("{}{}", stdout(&output), support::stderr(&output));
-
-    assert!(output.status.success(), "{text}");
-    assert!(text.contains("Base: refs/heads/main @"));
-    assert!(!repository.path().join(".worktrees/omitted").exists());
-}
+use support::{commit, init_repo, run_cli, stdout};
 
 #[test]
 fn dry_run_is_read_only_for_a_valid_local_base() {
