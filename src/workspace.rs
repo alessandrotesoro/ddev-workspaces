@@ -349,6 +349,10 @@ fn print_list_entry<R: CommandRunner>(
         println!("{}: NOT READY — {}", entry.name, source.issues.join("; "));
         return false;
     }
+    if let Err(error) = worktree_repository.worktree_is_clean(&path, runner) {
+        println!("{}: NOT READY — {error}", entry.name);
+        return false;
+    }
     let Some(config) = config else {
         println!(
             "{}: SOURCE-ONLY — configuration is missing from the manager root",
@@ -553,6 +557,7 @@ fn create_after_reservation<R: CommandRunner>(
     if !source.ready() {
         return Err(ToolError::new(format_source_failure(&source)));
     }
+    workspace_repository.worktree_is_clean(workspace, runner)?;
     for warning in &source.warnings {
         println!("Cleanup report: {warning}");
     }
@@ -888,6 +893,13 @@ fn prepare_files<R: CommandRunner>(
         if fs::symlink_metadata(&destination).is_ok() {
             return Err(ToolError::new(format!(
                 "file rule `{}` refuses to overwrite existing destination {}",
+                file.label,
+                destination.display()
+            )));
+        }
+        if !config::is_ignored(&workspace_repository.root, &destination, runner)? {
+            return Err(ToolError::new(format!(
+                "file rule `{}` destination {} is not ignored by Git; add an ignore rule manually",
                 file.label,
                 destination.display()
             )));
