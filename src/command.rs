@@ -209,18 +209,6 @@ fn shell_quote_for_display(argument: &str) -> String {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
-    struct FakeRunner {
-        requests: Vec<CommandRequest>,
-    }
-
-    impl CommandRunner for FakeRunner {
-        fn run(&mut self, request: &CommandRequest) -> ToolResult<CommandOutput> {
-            self.requests.push(request.clone());
-            Ok(CommandOutput::dry_run())
-        }
-    }
-
     #[test]
     fn sensitive_requests_redact_arguments_in_display() {
         let request = CommandRequest::new("printf", ["secret-value"]).sensitive();
@@ -248,15 +236,5 @@ mod tests {
         let output = runner.run(&request).expect("dry-run should succeed");
 
         assert!(output.success());
-    }
-
-    #[test]
-    fn fake_runner_is_a_single_command_seam() {
-        let mut runner = FakeRunner::default();
-        let request = CommandRequest::new("git", ["status"]);
-
-        runner.run(&request).expect("fake runner should succeed");
-
-        assert_eq!(runner.requests, vec![request]);
     }
 }

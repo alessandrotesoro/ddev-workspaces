@@ -114,10 +114,6 @@ pub fn run_cli(root: &Path, arguments: &[&str]) -> Output {
         .expect("binary should run")
 }
 
-pub fn run_cli_with_path(root: &Path, arguments: &[&str], command_directory: &Path) -> Output {
-    run_cli_with_path_and_vars(root, arguments, command_directory, &[])
-}
-
 pub fn run_cli_with_path_and_vars(
     root: &Path,
     arguments: &[&str],

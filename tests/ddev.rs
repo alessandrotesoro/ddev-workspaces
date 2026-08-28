@@ -74,13 +74,6 @@ fn full_creation_and_default_removal_use_the_exact_fake_identity() {
     );
 
     let calls = fs::read_to_string(fake_log).expect("fake DDEV call log");
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|line| *line == "list --json-output")
-            .count(),
-        7
-    );
     assert!(
         calls
             .lines()

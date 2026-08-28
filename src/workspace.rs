@@ -407,8 +407,8 @@ fn print_list_entry<R: CommandRunner>(
         }
     };
     match find_owned_ddev(&inspection.entries, &record.ddev_name, &app_root) {
-        Ok(Some(project))
-            if project.status.eq_ignore_ascii_case("running") && ddev_mutagen_ready(&project) =>
+        Ok(Some(_))
+            if ddev::require_ready_identity(inspection, &record.ddev_name, &app_root).is_ok() =>
         {
             println!("{}: READY — running at {}", entry.name, path.display());
             true
@@ -532,7 +532,7 @@ fn create_after_reservation<R: CommandRunner>(
     }
 
     prepare_files(project_config, workspace, &workspace_repository, runner)?;
-    let mut ddev_project = if let Some(ddev_config) = &project_config.ddev {
+    if let Some(ddev_config) = &project_config.ddev {
         let app_root = config::safe_join(workspace, &ddev_config.app_root)?;
         let inspection = ddev::list(runner, workspace)?;
         ddev::inspect_new_identity(&inspection, &record.ddev_name, &app_root)?;
@@ -544,15 +544,11 @@ fn create_after_reservation<R: CommandRunner>(
         )?;
         ddev::start(&app_root, runner)?;
         let after_start = ddev::list(runner, &app_root)?;
-        Some(ddev::require_ready_identity(
-            &after_start,
-            &record.ddev_name,
-            &app_root,
-        )?)
-    } else {
-        None
-    };
-    run_declared_commands(project_config, workspace, runner)?;
+        ddev::require_ready_identity(&after_start, &record.ddev_name, &app_root)?;
+    }
+    for command in &project_config.commands {
+        run_one_command(command, workspace, runner)?;
+    }
     let source = workspace_repository.diagnose(Some(&base.sha), runner)?;
     if !source.ready() {
         return Err(ToolError::new(format_source_failure(&source)));
@@ -561,15 +557,17 @@ fn create_after_reservation<R: CommandRunner>(
     for warning in &source.warnings {
         println!("Cleanup report: {warning}");
     }
-    if let Some(ddev_config) = &project_config.ddev {
+    let ddev_project = if let Some(ddev_config) = &project_config.ddev {
         let app_root = config::safe_join(workspace, &ddev_config.app_root)?;
         let after_commands = ddev::list(runner, &app_root)?;
-        ddev_project = Some(ddev::require_ready_identity(
+        Some(ddev::require_ready_identity(
             &after_commands,
             &record.ddev_name,
             &app_root,
-        )?);
-    }
+        )?)
+    } else {
+        None
+    };
     if let Some(reason) = runtime_precondition_failure(project_config, workspace) {
         return Err(ToolError::new(format!(
             "runtime readiness failed after declared commands: {reason}"
@@ -855,10 +853,6 @@ fn find_owned_ddev(
     }
 }
 
-fn ddev_mutagen_ready(project: &DdevProject) -> bool {
-    !project.mutagen_enabled || project.mutagen_status.eq_ignore_ascii_case("ok")
-}
-
 fn runtime_precondition_failure(config: &ProjectConfig, workspace: &Path) -> Option<String> {
     for file in &config.files {
         let destination = match config::safe_join(workspace, &file.destination) {
@@ -995,17 +989,6 @@ fn copy_file_atomically(
         let _ = fs::remove_file(&temporary);
     }
     result
-}
-
-fn run_declared_commands<R: CommandRunner>(
-    project_config: &ProjectConfig,
-    workspace: &Path,
-    runner: &mut R,
-) -> ToolResult<()> {
-    for command in &project_config.commands {
-        run_one_command(command, workspace, runner)?;
-    }
-    Ok(())
 }
 
 fn run_one_command<R: CommandRunner>(
@@ -1283,7 +1266,6 @@ fn require_confirmation(name: &str, provided: Option<&str>, purpose: &str) -> To
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn env_key_check_does_not_return_or_print_the_value() {
@@ -1298,25 +1280,5 @@ mod tests {
         };
 
         run_one_check(&check, directory.path()).expect("key should be ready");
-    }
-
-    #[test]
-    fn dry_run_output_requests_no_mutating_runner_call() {
-        let command = CommandRule {
-            label: "setup".to_owned(),
-            cwd: ".".to_owned(),
-            argv: vec!["printf".to_owned(), "secret".to_owned()],
-            sensitive: true,
-        };
-        let request = crate::command::CommandRequest::new(
-            command.argv[0].clone(),
-            command.argv[1..].to_vec(),
-        )
-        .cwd(Path::new("/tmp"))
-        .mutating()
-        .sensitive();
-
-        assert!(request.sensitive);
-        assert!(request.mutating);
     }
 }
