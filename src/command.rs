@@ -61,6 +61,7 @@ pub struct CommandRequest {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
     pub sensitive: bool,
     pub mutating: bool,
 }
@@ -75,6 +76,7 @@ impl CommandRequest {
             program: program.into(),
             args: args.into_iter().map(Into::into).collect(),
             cwd: None,
+            env: Vec::new(),
             sensitive: false,
             mutating: false,
         }
@@ -82,6 +84,11 @@ impl CommandRequest {
 
     pub fn cwd(mut self, cwd: &Path) -> Self {
         self.cwd = Some(cwd.to_path_buf());
+        self
+    }
+
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((name.into(), value.into()));
         self
     }
 
@@ -158,6 +165,7 @@ impl CommandRunner for RealCommandRunner {
 
         let mut command = Command::new(&request.program);
         command.args(&request.args);
+        command.envs(request.env.iter().map(|(name, value)| (name, value)));
         if let Some(cwd) = &request.cwd {
             command.current_dir(cwd);
         }

@@ -37,26 +37,26 @@ ignore rule yourself; the tool never edits ignore files.
 
 ```toml
 version = 1
-project_id = "filebean"
+project_id = "example-app"
 workspace_root = ".worktrees"
 
 [ddev]
 app_root = "."
 
 [[files]]
-label = "Laravel environment"
-destination = "apps/laravel/.env"
-template = "apps/laravel/.env.example"
+label = "Local environment"
+destination = ".env"
+template = ".env.example"
 
 [[commands]]
-label = "Install PHP dependencies"
-cwd = "apps/laravel"
+label = "Install dependencies"
+cwd = "."
 argv = ["ddev", "composer", "install"]
 
 [[checks]]
-label = "Laravel app key"
+label = "Application key"
 kind = "env-key"
-path = "apps/laravel/.env"
+path = ".env"
 key = "APP_KEY"
 ```
 
@@ -79,6 +79,8 @@ name `dw-<project_id>--<workspace-name>`.
 tracked paths, sparse checkout, submodule/LFS state, worktree metadata, config
 validity, and DDEV observations. Warnings about unrelated stale or prunable
 state are reported with manual guidance; they are not repaired automatically.
+DDEV discovery runs against an ephemeral copy of its registry and global
+configuration so DDEV cannot prune the user's registry during diagnosis.
 
 `create NAME` first resolves the base and checks all safe collisions. With no
 `--base`, it queries `origin`'s advertised symbolic `HEAD` and requires that
@@ -121,21 +123,64 @@ unrelated resources.
 
 ## Pilot acceptance
 
-Filebean and barn2site are manual acceptance pilots, not automated test
-fixtures. Before either pilot, obtain separate approval for an untracked
-`.ddev-workspaces.toml`, choose an ignored disposable workspace root, and
-confirm the intended DDEV name and canonical app root are unused.
+Documentably and Posts Table Pro are the two manual acceptance pilots; neither
+is an automated fixture or a persisted project configuration. Both run from
+fresh disposable clones at the remote-advertised default commit, with an
+untracked `.ddev-workspaces.toml`, clone-local ignore rules, unique workspace
+identities, and exact cleanup after verification.
 
-For Filebean, verify the advertised default-branch SHA with `doctor` and a
-dry-run, name only the tracked Laravel environment template, and let the
-existing project setup command own Composer, app-key, migration, and frontend
-work. Confirm the generated environment, dependencies, build manifest, exact
-DDEV identity, running status, and Mutagen health before exercising removal.
+Documentably is source-only coverage. `doctor`, dry-run, `create
+--source-only`, ownership/source verification, `list`, and safe removal prove
+the Git lifecycle and tracked dotfiles. Because source-only creation
+intentionally skips runtime commands and checks, the repository's pinned
+`corepack pnpm install --frozen-lockfile` and `corepack pnpm build` run
+manually inside the owned disposable worktree; `list` then verifies the
+ignored `packages/cli/dist/index.js` artifact. This pilot does not test DDEV
+or declared-command orchestration.
 
-For barn2site, run `doctor` first and confirm its hidden index flags, missing
-tracked path, nested gitlink, private submodule, and prunable metadata are
-visible. Use `--source-only` while validating recursive submodule readiness;
-configure only the cwd-specific commands and local sources explicitly chosen
-for the pilot. Do not copy `.ddev`, uploads, certificates, snapshots,
-databases, or other hidden files in bulk, and do not add upload or database
-commands without separate approval.
+Posts Table Pro is disposable DDEV coverage around tracked WordPress-plugin
+source, not a functional WordPress/database test. One explicit local file rule
+publishes a temporary ignored `.ddev/config.yaml`; the configuration disables
+settings management and Mutagen and omits the database. No uploads,
+certificates, snapshots, secrets, imports, or package commands are supplied.
+Acceptance requires the exact unique DDEV name/path/running identity and then
+confirmed removal of the owned worktree, registration, container, network,
+temporary config, clone, and any exact unreferenced project-built image.
+
+### Acceptance evidence
+
+The replacement pilots passed on 2026-08-29 with the release binary built from
+the PR source at `b53ddc3a408dcbe4412d3a361ad39aadef5cc33f`.
+After the final read-only DDEV-registry correction, the disposable Posts Table
+Pro runtime pilot was repeated against the corrected release build with the
+new identity `dw-ptp-final--head-proof-20260829`; full create, list, managed
+doctor, removal dry-run, confirmed removal, registry/container hash controls,
+and exact resource cleanup all passed again.
+
+Documentably's remote advertised `refs/heads/main` at
+`0bc83fc1f5f410de2a2e45d503152078ca32beed`. In a fresh disposable clone,
+`doctor`, source-only dry-run, and `create --source-only dw-doc-acceptance`
+passed at that exact SHA. The managed worktree was clean and retained the
+tracked `.agents`, `.codex`, `.github`, `.gitignore`, and `.mcp.json`
+tree/blob identities. `corepack pnpm install --frozen-lockfile` and `corepack
+pnpm build` passed with the repository-pinned pnpm `10.34.5`; `list` and
+managed-workspace `doctor` then reported the ignored
+`packages/cli/dist/index.js` artifact ready. Removal dry-run and `remove
+--confirm dw-doc-acceptance dw-doc-acceptance` passed. The exact retained
+pilot branch and disposable clone were then removed; the normal checkout
+remained clean at the same commit.
+
+Posts Table Pro's remote advertised `refs/heads/master` at
+`6ed8023b236ac3819060760036dfc5c45e19359c`. In a fresh disposable clone
+outside the parent DDEV application, doctor and full-create dry-run passed,
+then `create acceptance-20260829` reached `READY` as
+`dw-ptp-pilot--acceptance-20260829` at the exact canonical workspace path.
+The copied `.ddev/config.yaml` was private and byte-identical to its named
+temporary source. DDEV reported one healthy WordPress-classified web runtime,
+Mutagen disabled, and no database container; no project volume, uploads path,
+snapshot, secret, import, certificate, or package command was present. `list`,
+managed-workspace `doctor`, removal dry-run, and `remove --confirm
+acceptance-20260829 acceptance-20260829` passed. The exact retained pilot
+branch, project image, isolated DDEV home, temporary config, and disposable
+clone were removed. The normal DDEV registry, pre-existing container set, and
+shared DDEV network identity matched their pre-pilot hashes.

@@ -416,7 +416,7 @@ mod tests {
     fn valid_config() -> ProjectConfig {
         ProjectConfig {
             version: 1,
-            project_id: "filebean".to_owned(),
+            project_id: "fixture".to_owned(),
             workspace_root: ".worktrees".to_owned(),
             ddev: None,
             files: Vec::new(),
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         let result = toml::from_str::<ProjectConfig>(
-            "version = 1\nproject_id = 'filebean'\nworkspace_root = '.worktrees'\nfuture = true\n",
+            "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\nfuture = true\n",
         );
 
         assert!(result.is_err());
@@ -440,7 +440,7 @@ mod tests {
         let config = directory.path().join(CONFIG_FILE);
         fs::write(
             &config,
-            "version = 2\nproject_id = 'filebean'\nworkspace_root = '.worktrees'\n",
+            "version = 2\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n",
         )
         .expect("configuration should be written");
         let loaded = ProjectConfig::load(directory.path()).expect("TOML should parse");

@@ -17,7 +17,7 @@ execution: code
 - **Authority:** User requirements and safety constraints override this plan; current Git and DDEV evidence constrains command behavior; project configuration controls project-specific preparation.
 - **Execution profile:** Implement and test locally with temporary fixture repositories and fake external commands. Do not exercise real pilot projects until automated verification passes.
 - **Stop conditions:** Stop before destructive cleanup when ownership, canonical paths, Git identity, DDEV identity, or user confirmation is missing.
-- **Tail ownership:** The implementer owns Rust tests and documentation. The user owns pilot credentials, local secret sources, databases, uploads, and approval for operations in Filebean and barn2site.
+- **Tail ownership:** The implementer owns Rust tests, documentation, and exact cleanup of the two approved disposable pilots. The pilots use no production credentials, databases, uploads, snapshots, or existing DDEV registrations.
 
 ---
 
@@ -35,7 +35,7 @@ Fresh Git worktrees usually contain the correct tracked tree, but they often lac
 
 - **Runnable by default:** `create` targets full runtime readiness; `--source-only` stops after complete source preparation. Governs R8 and R9. (session-settled: user-approved — chosen over source-only by default: the recurring problem is unusable workspaces after a correct checkout.)
 - **Proven ownership before deletion:** `remove` deletes only resources bound by a tool-owned record and current Git/DDEV identity. Persistent DDEV data needs a second explicit confirmation. Governs R16 and R17. (session-settled: user-approved — chosen over broad cleanup: existing repositories and DDEV contain user-managed state.)
-- **Two pilots only:** Filebean and barn2site validate v1; DLA, Documentably, Grepzilla, and the licensing worker remain rollout candidates. Governs R21. (session-settled: user-approved — chosen over project-specific v1 support for every inspected repository: one explicit command mechanism covers later rollout.)
+- **Two replacement pilots only:** Documentably validates source-only Git/worktree ownership and a manually prepared Node build; Posts Table Pro validates explicit file publication and a fully disposable DDEV runtime. Documentably does not test DDEV or declared-command orchestration, and Posts Table Pro does not test a functional WordPress/database installation. Governs R21. (session-settled: user-approved — the previous pilot pair was explicitly rejected.)
 
 ### Requirements
 
@@ -73,12 +73,12 @@ Fresh Git worktrees usually contain the correct tracked tree, but they often lac
 **Quality and rollout contract**
 
 - R20. Most automated tests use temporary local Git repositories and a fake command runner and require no Docker, DDEV, network, private credentials, or source-project mutation.
-- R21. Manual acceptance proves the finished binary against Filebean and barn2site before later configuration rollout to the other inspected projects.
+- R21. Manual acceptance proves the finished binary with a Documentably source-only pilot and a Posts Table Pro disposable DDEV pilot before merge.
 
 ### Success Criteria
 
-- A fresh managed Filebean workspace starts from the reported `origin/main` commit, includes all tracked dotfiles, materializes declared Laravel requirements, and binds a unique healthy DDEV project to the new path.
-- A barn2site workspace cannot report source readiness while any required nested submodule is uninitialized, mismatched, or unauthenticated.
+- A fresh managed Documentably workspace starts from the reported `origin/main` commit, preserves tracked dotfiles, reaches source-only readiness, accepts the repository's pinned manual Node preparation/build, reports the configured build artifact ready, and is safely removed.
+- A fresh managed Posts Table Pro workspace starts from the reported `origin/master` commit, materializes only an explicit disposable DDEV configuration, binds one unique running DDEV web container to the exact workspace path, and is safely removed without a database, uploads, snapshots, secrets, or retained project resources.
 - Doctor exposes hidden index flags, prunable metadata, stale DDEV paths, name/path collisions, and Mutagen failures without changing them.
 - Remove cannot affect an unmanaged path or a DDEV project registered to another app root.
 
@@ -87,7 +87,7 @@ Fresh Git worktrees usually contain the correct tracked tree, but they often lac
 - AE1. **Covers R4-R6:** Given the primary checkout is on a stale documentation branch, when `create task-1` runs without `--base`, then the tool uses `origin`'s advertised default-branch ref and SHA rather than the current branch. If that advertised SHA is not local, it makes no mutation and prints the exact fetch command the user must run.
 - AE2. **Covers R6:** Given a tracked dotfile is absent behind skip-worktree, when `doctor` runs, then source readiness is `NOT READY` even if `git status` is clean.
 - AE3. **Covers R7:** Given a private recursive submodule cannot authenticate, when source preparation runs, then creation preserves the owned workspace as `NOT READY` and names the failing path without exposing credentials.
-- AE4. **Covers R12-R15:** Given Filebean has a tracked environment template and declared build commands, when full creation succeeds, then the ignored environment, dependencies, frontend manifest, and exact DDEV binding pass their checks.
+- AE4. **Covers R12-R15:** Given Posts Table Pro has an ignored destination and an explicit local disposable DDEV configuration source, when full creation succeeds, then the named file, plugin entrypoint, exact DDEV binding, running state, and disabled Mutagen state pass their checks.
 - AE5. **Covers R15 and R19:** Given the intended DDEV name is registered to another canonical path, when create or remove preflight runs, then it refuses mutation and reports the conflicting name and path.
 - AE6. **Covers R16-R18:** Given a directory resembles a workspace but lacks a valid ownership record, when `remove` runs, then it refuses without invoking Git or DDEV removal.
 
@@ -101,7 +101,7 @@ Fresh Git worktrees usually contain the correct tracked tree, but they often lac
 
 #### Deferred to Follow-Up Work
 
-- Project configuration rollout for DLA, Documentably, Grepzilla, and the licensing worker.
+- Persisted project configuration rollout for Documentably, Posts Table Pro, DLA, Grepzilla, and the licensing worker; the acceptance configurations remain temporary pilot inputs.
 - Qualification for Linux and Windows after the macOS pilot is stable.
 - Convenience commands for retrying a failed preparation sequence; v1 preserves the workspace and prints the failed step for manual remediation.
 
@@ -133,26 +133,26 @@ The v1 shape is intentionally finite. This example is directional syntax; the fi
 
 ```toml
 version = 1
-project_id = "filebean"
+project_id = "example-app"
 workspace_root = ".worktrees"
 
 [ddev]
 app_root = "."
 
 [[files]]
-label = "Laravel environment"
-destination = "apps/laravel/.env"
-template = "apps/laravel/.env.example"
+label = "Local environment"
+destination = ".env"
+template = ".env.example"
 
 [[commands]]
-label = "Install PHP dependencies"
-cwd = "apps/laravel"
+label = "Install dependencies"
+cwd = "."
 argv = ["ddev", "composer", "install"]
 
 [[checks]]
-label = "Laravel app key"
+label = "Application key"
 kind = "env-key"
-path = "apps/laravel/.env"
+path = ".env"
 key = "APP_KEY"
 ```
 
@@ -162,7 +162,7 @@ Rules:
 - `workspace_root` is repository-relative, must not escape the repository through symlinks, and must already be ignored by Git. The tool never edits ignore files.
 - A `[ddev]` table contains only repository-relative `app_root`; its presence means full creation must establish DDEV. The app root must contain `.ddev/config.yaml` after named file materialization, and `.ddev/config.ddev-workspaces.yaml` must be absent and ignored before the tool creates it.
 - A file rule requires `label` and `destination` plus exactly one of `template` or `source_env`. Sources and destinations must resolve to regular files; v1 does not recursively copy directories.
-- A file rule may create only its missing parent directories inside the workspace. This is required for barn2site's ignored `.ddev/config.yaml`; it does not authorize scanning or copying the source directory.
+- A file rule may create only its missing parent directories inside the workspace. This is required for the Posts Table Pro pilot's ignored `.ddev/config.yaml`; it does not authorize scanning or copying the source directory.
 - A command requires `label`, repository-relative `cwd`, and non-empty string-array `argv`. It runs directly without a shell. Optional `sensitive` defaults to `false`; when true it suppresses captured output and argv details from user output.
 - A check requires `label`, `kind`, and repository-relative `path`. `path-exists` has no other fields; `env-key` additionally requires `key`. Preparation commands already use exit status; v1 has no second arbitrary-command mechanism for readiness.
 - WordPress uploads and database imports use explicit argv commands marked sensitive. They are absent by default.
@@ -210,7 +210,7 @@ flowchart TB
 - `doctor` is read-only. It may run Git and DDEV reporting commands, including Git's prune dry run, but never a mutating remediation.
 - `create` completes every read-only preflight before reserving state. It uses `git worktree add -b` with an explicit absolute path and commit, never `-B`, `--force`, or implicit commit selection.
 - Submodule network work happens only after the owned worktree exists. LFS uses local checkout only and reports a missing object with manual remediation; the tool does not fetch LFS content. Failures preserve the workspace.
-- Full creation materializes named files first, writes the owned `config.ddev-workspaces.yaml`, verifies DDEV identity, starts DDEV, then runs declared commands and readiness checks. This ordering lets Filebean's existing `pnpm setup` call `ddev composer setup` against the correct workspace.
+- Full creation materializes named files first, writes the owned `config.ddev-workspaces.yaml`, verifies DDEV identity, starts DDEV, then runs declared commands and readiness checks. This ordering lets project commands target the exact owned DDEV workspace.
 - Project commands receive only inherited environment plus tool-owned non-secret variables. The tool never echoes environment values.
 - `remove` rechecks identity immediately before each Git or DDEV mutation. Default DDEV cleanup uses `ddev stop --unlist <name>`. Data deletion uses `ddev stop --remove-data --unlist <name>` with DDEV's default snapshot behavior and a second confirmation; v1 never invokes `ddev delete` because its unrelated-container cleanup defaults are broader than the owned project.
 - Branch deletion, Git metadata pruning, unrelated DDEV unlisting, Mutagen reset/sync, and manual path deletion are never part of v1.
@@ -267,7 +267,7 @@ tests/
 - **Files:** `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `src/main.rs`, `src/cli.rs`, `src/command.rs`, `src/config.rs`, `tests/cli.rs`, `tests/config.rs`, `tests/support/mod.rs`.
 - **Approach:** Keep orchestration synchronous. Parse one schema version and reject unknown keys. Centralize subprocess execution and redaction without creating service objects for each command.
 - **Execution note:** Start with CLI/config contract tests because every later unit consumes them.
-- **Evidence:** Stable Rust 1.97.1 is installed; the evaluated dependency feature set compiled in the isolated Cargo trial. The configuration fields map directly to the Filebean and barn2site preparation evidence listed under Sources and Research.
+- **Evidence:** Stable Rust 1.97.1 is installed; the evaluated dependency feature set compiled in the isolated Cargo trial. The configuration fields map directly to the Documentably and Posts Table Pro acceptance contracts listed under Sources and Research.
 - **Test scenarios:**
   - Each supported command and option parses, produces help, and rejects unknown or conflicting arguments.
   - Missing, malformed, future-version, unknown-field, escaping-path, and non-ignored-workspace-root configurations fail with location and remediation.
@@ -284,7 +284,7 @@ tests/
 - **Dependencies:** U1.
 - **Files:** `src/git.rs`, `tests/git_integrity.rs`, `tests/support/mod.rs`.
 - **Approach:** Implement KTD1-KTD3 with NUL-safe parsers. Separate read-only diagnostics from mutating create helpers. Sanitize remote and submodule errors before returning them. Let Git perform tracked-content comparison; local code only parses results, checks enumerated-path presence, and composes diagnostics.
-- **Evidence:** Filebean is on `docs/reconcile-delivery-roadmap` at `23c6664`, 33 commits behind its upstream, while `refs/remotes/origin/HEAD` points to `origin/main` at `1a9d97d`; barn2site has prunable metadata, four `S` index entries, a missing tracked `wp-content/mu-plugins/maintenance.php`, eleven top-level gitlinks, a nested gitlink, and one uninitialized private SSH submodule. Git 2.50.1 documents stable `worktree list --porcelain -z` output and clean, non-forced removal boundaries.
+- **Evidence:** Documentably and Posts Table Pro each expose a remote-advertised default commit that differs from mutable local checkout state, tracked dotfiles, and ignored generated/runtime destinations. Git 2.50.1 documents stable `worktree list --porcelain -z` output and clean, non-forced removal boundaries.
 - **Test scenarios:**
   - Omitted base resolves a fixture remote's symbolic default branch and never the stale current branch; explicit bases resolve without remote discovery.
   - Missing remote HEAD, failed remote query, advertised-but-absent local SHA, ambiguous ref, existing branch, and occupied path stop before worktree creation; no test expects an implicit fetch.
@@ -292,8 +292,8 @@ tests/
   - Sparse checkout, skip-worktree, assume-unchanged, detached, locked, and prunable states are reported independently.
   - Local recursive submodules initialize and verify; uninitialized, mismatched, conflicted, nested, and sanitized authentication failures report the affected path.
   - LFS-free repositories require no LFS binary; a declared LFS fixture reports missing tooling and pointer-only state without network.
-- **Verification commands:** `cargo test --test git_integrity`; `cargo test --test lifecycle omitted_base`.
-- **Acceptance:** A fixture on a stale current branch chooses the advertised `origin/HEAD` SHA when local, refuses with a manual fetch command when it is absent, and reports every established Filebean/barn2site source failure without touching either pilot.
+- **Verification commands:** `cargo test --test git_integrity`; `cargo test --test git_integrity create_without_base_uses_the_advertised_origin_head_sha`.
+- **Acceptance:** A fixture on a stale current branch chooses the advertised `origin/HEAD` SHA when local, refuses with a manual fetch command when it is absent, and reports established source failures without touching either pilot repository.
 - **Scope boundary:** No implicit fetch, push, prune, repair, forced worktree operation, custom blob hashing, or LFS network download.
 
 ### U3. Ownership records and readiness evaluation
@@ -320,7 +320,7 @@ tests/
 - **Dependencies:** U1, U3.
 - **Files:** `src/workspace.rs`, `tests/preparation.rs`, `tests/support/mod.rs`.
 - **Approach:** Validate all sources and destinations before copying. Use create-new semantics and restrictive permissions for local-source files. Stop at the first failed command and preserve the owned workspace.
-- **Evidence:** Filebean's tracked `apps/laravel/.env.example` coexists with ignored `.env`, `vendor`, root `node_modules`, and `public/build`; its root `setup` and Laravel Composer scripts already own dependency, key, migration, and generated-asset behavior. barn2site's `.ddev/` and uploads are ignored and its Composer/npm work is distributed across explicit subdirectories.
+- **Evidence:** Documentably's tracked lockfile and manifests define a pinned Node preparation/build with ignored generated output. Posts Table Pro has no tracked DDEV configuration; its pilot names one temporary local `.ddev/config.yaml` source and does not name database, uploads, certificates, snapshots, secrets, or package commands.
 - **Test scenarios:**
   - A tracked template copies to a missing destination and refuses an existing destination.
   - A named local source accepts an absolute regular file, rejects missing, relative, directory, symlink-escape, and destination-escape cases, and never logs its resolved value or contents.
@@ -328,7 +328,7 @@ tests/
   - Path and environment-key checks distinguish runtime readiness without printing inspected values or output.
   - Source-only mode invokes none of the file, command, or runtime-check actions.
 - **Verification commands:** `cargo test --test preparation`; `cargo test --test lifecycle source_only`.
-- **Acceptance:** Only named files are created and only declared argv runs; Filebean can express its setup without copying secrets or adding Rust Laravel logic, while barn2site imports/uploads remain absent until explicitly configured.
+- **Acceptance:** Only named files are created and only declared argv runs; the Posts Table Pro pilot publishes exactly one disposable DDEV file, while uploads, database imports, secrets, and package commands remain absent.
 - **Scope boundary:** No directory copy, globbing, secret discovery, shell execution, adapter hierarchy, retry engine, or arbitrary readiness command.
 
 ### U5. Exact DDEV integration
@@ -337,12 +337,13 @@ tests/
 - **Requirements:** R3, R8, R9, R15, R18-R20.
 - **Dependencies:** U1, U3.
 - **Files:** `src/ddev.rs`, `tests/ddev.rs`, `tests/support/mod.rs`.
-- **Approach:** Parse the JSON list envelope defensively. Create one owned ignored override only when its target path is absent and ignored. Verify name and canonical app root before start, after start, and before cleanup.
-- **Evidence:** Installed DDEV v1.25.3 exposes global `--json-output`; current `ddev list` records include `name`, `approot`, `status`, `mutagen_enabled`, and `mutagen_status`. Current state proves a Filebean name bound to another worktree, three deleted temporary paths, and a separate project with Mutagen problems. DDEV documents `config.*.yaml` local overrides, non-destructive `ddev stop --unlist`, and snapshot-by-default data removal.
+- **Approach:** Run DDEV list against an ephemeral copy of its registry/global configuration, parse the JSON envelope defensively, and report any stale-entry warning without allowing DDEV to prune the user's registry. Create one owned ignored override only when its target path is absent and ignored. Verify name and canonical app root before start, after start, and before cleanup.
+- **Evidence:** Installed DDEV v1.25.3 exposes global `--json-output`; list records include `name`, `approot`, `status`, `mutagen_enabled`, and `mutagen_status`. The replacement runtime pilot uses a unique name, exact external workspace path, database omission, disabled Mutagen/settings management, and an isolated DDEV global configuration. DDEV documents `config.*.yaml` local overrides and non-destructive `ddev stop --unlist`.
 - **Test scenarios:**
   - No DDEV configuration skips integration; source-only mode never probes or starts DDEV.
   - Expected name/path, running status, and Mutagen `ok` pass readiness.
   - Same name at another path, same path under another name, duplicates, stale missing paths, stopped status, malformed JSON, missing DDEV, and representative non-`ok` Mutagen states fail safely.
+  - Doctor preserves the real DDEV registry even when DDEV would prune a stale entry from the isolated inspection copy.
   - An existing local override or a generated override not ignored by Git is never overwritten.
   - Default cleanup issues stop/unlist only for the exact owned identity; data deletion is inaccessible without the separate confirmed path.
 - **Verification commands:** `cargo test --test ddev`; `cargo test --test lifecycle ddev_identity`.
@@ -356,7 +357,7 @@ tests/
 - **Dependencies:** U2-U5.
 - **Files:** `src/workspace.rs`, `src/main.rs`, `tests/lifecycle.rs`.
 - **Approach:** Follow the managed-state data flow. Complete all non-mutating checks first. Preserve every post-reservation failure as an owned `NOT READY` workspace and print the failed phase plus doctor/removal guidance.
-- **Evidence:** Filebean's primary checkout and live DDEV registration currently point at different revisions/paths; both pilots have existing user worktree state. Preserving an owned failed workspace gives the user evidence without risking cross-system rollback against that state.
+- **Evidence:** Both replacement source repositories have existing checkout/worktree state that the pilots must not adopt or mutate. Preserving an owned failed workspace gives the user evidence without risking cross-system rollback against unrelated state.
 - **Test scenarios:**
   - Full creation reaches `READY` only after source, configured runtime, and DDEV checks pass.
   - Source-only creation reaches `READY — source-only` after complete source verification and performs no runtime work.
@@ -374,7 +375,7 @@ tests/
 - **Dependencies:** U2, U3, U5, U6.
 - **Files:** `src/workspace.rs`, `src/main.rs`, `tests/lifecycle.rs`.
 - **Approach:** Doctor runs the same current-state evaluators as create without mutation. List reads records in the current common directory and recomputes compact status. Remove implements the removal safety flow and deletes the record last.
-- **Evidence:** Both pilots have prunable worktree metadata; barn2site has hidden index flags that normal status does not expose; current DDEV state has deleted temporary paths and name/path drift. Git refuses main, dirty, locked, and submodule-bearing worktree removal without force; DDEV v1.25.3 distinguishes non-destructive unlisting from data removal.
+- **Evidence:** Both replacement repositories have existing worktree metadata and local state that must remain unrelated to the disposable pilot clones. Current DDEV state also proves why exact name/path identity is required. Git refuses main, dirty, locked, and submodule-bearing worktree removal without force; DDEV v1.25.3 distinguishes non-destructive unlisting from data removal.
 - **Test scenarios:**
   - Doctor accepts a repository root, subdirectory, linked worktree, and managed workspace, and explains missing config or ownership without assuming `.git` is a directory.
   - Doctor reports prunable Git metadata and stale/duplicate DDEV state with manual dry-run cleanup guidance only.
@@ -394,7 +395,7 @@ tests/
 - **Dependencies:** U6, U7.
 - **Files:** `README.md`.
 - **Approach:** Document the finite v1 contract and examples below. Keep workspace-manager, later project adapters, and future-platform speculation out of usage guidance.
-- **Evidence:** Filebean's root and Laravel manifests expose the actual setup/build/quality commands; barn2site's `.gitmodules`, root and nested manifests, ignored `.ddev`, and private SSH URLs define the two pilot procedures. Neither repository contains a v1 project config yet, so pilot config creation remains separately authorized acceptance work.
+- **Evidence:** Documentably's tracked Node manifest, lockfile, CLI launcher, and ignored build output define its source-only/manual-build procedure. Posts Table Pro's tracked plugin entrypoint and absence of a tracked DDEV configuration define its explicit-file disposable runtime procedure. Neither repository contains a persisted v1 project config; both acceptance configurations are temporary and removed.
 - **Test expectation:** None — this unit documents behavior already verified by U1-U7 and requires manual pilot acceptance.
 - **Verification commands:** `cargo run -- --help`; `cargo run -- doctor --help`; `cargo run -- create --help`; `cargo run -- list --help`; `cargo run -- remove --help`; then the separately authorized pilot steps below.
 - **Acceptance:** A developer can configure a repository, predict every mutation, diagnose `NOT READY`, and understand what remove preserves or deletes without reading Rust source; both pilots pass before rollout.
@@ -405,21 +406,21 @@ tests/
 ## CLI UX
 
 ```text
-$ ddev-workspaces create invoice-fix
-Repository: app.filebean
-Base: origin/main @ 1a9d97d09412014ed980b4ade717862b89631ef7
-Workspace: .worktrees/invoice-fix
+$ ddev-workspaces create task-1
+Repository: example-app
+Base: refs/heads/main @ <full-sha>
+Workspace: .worktrees/task-1
 Source: READY
 Runtime: READY
-DDEV: dw-filebean--invoice-fix @ .worktrees/invoice-fix (running, Mutagen ok)
+DDEV: dw-example-app--task-1 @ .worktrees/task-1 (running, Mutagen disabled)
 READY
 ```
 
 ```text
-$ ddev-workspaces doctor /path/to/barn2site
+$ ddev-workspaces doctor /path/to/repository
 Source: NOT READY
-- skip-worktree: wp-content/mu-plugins/maintenance.php (tracked path missing)
-- submodule: wp-content/mu-plugins/vendor/barn2/php-standards (uninitialized)
+- skip-worktree: path/to/tracked-file (tracked path missing)
+- submodule: vendor/private-module (uninitialized)
 Cleanup report: 1 prunable Git worktree record; no changes made
 NOT READY — restore tracked paths and authenticate private submodules, then rerun doctor
 ```
@@ -434,11 +435,11 @@ READY — source-only workspace
 ```
 
 ```text
-$ ddev-workspaces remove invoice-fix
-Will stop and unlist DDEV project dw-filebean--invoice-fix.
-Will remove managed worktree .worktrees/invoice-fix.
-Will retain branch invoice-fix and DDEV data.
-Type invoice-fix to confirm: invoice-fix
+$ ddev-workspaces remove task-1
+Will stop and unlist DDEV project dw-example-app--task-1.
+Will remove managed worktree .worktrees/task-1.
+Will retain branch task-1.
+Type task-1 to confirm: task-1
 READY — managed workspace removed; branch and DDEV data retained
 ```
 
@@ -455,26 +456,26 @@ Exit code `0` means the requested outcome is ready or completed. Exit code `1` m
 | `cargo test --all-targets` | U1-U7 | Unit and integration fixtures pass without network, DDEV, Docker, or private credentials. |
 | Temporary real-Git integration suite | U2, U3, U6, U7 | Every tracked-content, worktree, submodule, base, and ownership failure class is reproduced locally. |
 | Fake-runner call receipts | U4-U7 | Expected calls and ordering are present; forbidden calls and secret output are absent. |
-| Filebean pilot | U8 | Full creation reaches `READY` from the exact default-branch SHA with declared Laravel outputs and unique DDEV identity. |
-| barn2site pilot | U8 | Doctor catches existing hidden flags; source creation handles recursive private submodules; full creation uses only explicitly named DDEV/files/commands. |
+| Documentably pilot | U8 | Source-only creation reaches `READY` from the exact advertised SHA with tracked dotfiles intact; the pinned manual Node setup/build produces the configured ignored artifact; list and safe removal pass. |
+| Posts Table Pro pilot | U8 | Full creation publishes only the named disposable DDEV file, reaches exact unique DDEV readiness with the database and Mutagen omitted, and removes every owned disposable runtime resource. |
 
-### Pilot Procedure: Filebean
+### Pilot Procedure: Documentably
 
-1. Obtain separate approval to place an untracked pilot `.ddev-workspaces.toml` in the primary checkout and choose an ignored disposable workspace root. The current `.worktrees/` is not ignored, so the user must first add the chosen root to a local Git exclude or select another already ignored repository-relative root; the tool must not do this.
-2. Run doctor first and save the report showing the primary branch, `origin/main`, prunable metadata, and current DDEV name/path registrations.
-3. Run create dry-run and verify the advertised `origin/main` SHA is already local, the name is `dw-filebean--<workspace>`, DDEV's app root is the workspace root, the environment template is named explicitly, and the single existing root `pnpm setup` command runs only after DDEV start. Its existing script owns pnpm install, `ddev composer setup`, app-key generation, migrations, and the frontend build.
-4. Run full create only after confirming no intended name/path collision. Verify tracked dotfiles, `apps/laravel/.env`, `apps/laravel/vendor`, root `node_modules`, `apps/laravel/public/build/manifest.json`, DDEV app root equal to the canonical workspace root, `composer_root: apps/laravel`, running status, and Mutagen health without printing secrets.
-5. Run doctor from both the primary checkout and linked workspace. Confirm both resolve the same Git common directory and only the workspace reports the generated DDEV identity.
-6. Run remove dry-run, then confirmed default removal. Verify the branch and DDEV data remain and no unrelated registration or worktree metadata changes.
+1. Create a fresh disposable clone outside the normal checkout, resolve `origin`'s advertised `HEAD` immediately before mutation, and require that exact commit locally. Add only the pilot workspace root to the clone-local exclude and place an untracked `.ddev-workspaces.toml` in the clone root.
+2. Configure `project_id = "documentably"`, no `[ddev]`, and a `path-exists` readiness check for `packages/cli/dist/index.js`. Run doctor and source-only create dry-run, then verify neither changes the clone.
+3. Run `create --source-only` and prove the exact base SHA, ownership record, clean tracked tree, and tracked dotfile tree/blob identities. This mode intentionally skips configured files, commands, readiness checks, and DDEV.
+4. Inside the owned workspace, run the repository's pinned `corepack pnpm install --frozen-lockfile` and `corepack pnpm build`. Verify `packages/cli/dist/index.js` exists and all generated output is ignored.
+5. Run `list` to recompute source and configured non-DDEV readiness, then run remove dry-run and confirmed removal. Remove the exact retained disposable branch and clone only after proving the worktree and ownership record are gone.
+6. Record this as source-only lifecycle plus manual project-build evidence. It is not evidence for DDEV or declared-command orchestration.
 
-### Pilot Procedure: barn2site
+### Pilot Procedure: Posts Table Pro
 
-1. Obtain separate approval for an untracked pilot config. Name only the required local `.ddev/config.yaml` source; do not copy `.ddev`, hidden files, snapshots, certificates, database files, or uploads broadly.
-2. Run doctor on the current checkout and confirm it reports the absent skip-worktree file, all index flags, the uninitialized `php-standards` submodule, the nested `email-capture/util` relationship, and prunable metadata.
-3. Run source-only create from the advertised `origin/master`. Without private SSH credentials, verify `NOT READY` names the failing submodule path and preserves the owned worktree. With credentials, verify every recursive gitlink matches the superproject commit.
-4. Configure full readiness with only commands proven necessary for the pilot, such as the theme's declared npm build or the mu-plugin Composer/npm commands at their exact cwd. Do not run every discovered manifest. Add uploads or a database import only as separate sensitive commands when the user chooses those local sources.
-5. Run full create and verify the unique barn2site DDEV identity, exact app root, running status, and Mutagen health.
-6. Exercise dry-run and confirmed removal with the same branch/data preservation checks as Filebean.
+1. Create a fresh disposable clone outside the parent DDEV application and every normal/release worktree. Resolve `origin`'s advertised `HEAD` immediately before mutation, require the exact commit locally, and use a unique workspace/project name proven absent from Git, DDEV, and Docker.
+2. In clone-local excludes, ignore only the pilot workspace root and `.ddev/`. Use an untracked project config with one `source_env` file rule for `.ddev/config.yaml`, plus path checks for the tracked plugin entrypoint and copied DDEV file.
+3. The temporary DDEV file uses the WordPress project type only as a runtime classification, with `docroot: .`, `disable_settings_management: true`, `performance_mode: none`, and `omit_containers: [db]`. Isolated global settings omit the router and SSH agent and disable snapshots/instrumentation. No uploads, database data, certificates, secrets, or preparation commands are supplied.
+4. Run doctor and full create dry-run, then full create. Verify exact advertised base, tracked plugin source, one copied ignored DDEV file, exact canonical app root/name, running web container, disabled Mutagen, no database container/volume, and no uploads path.
+5. Run `list`, DDEV identity/path/status inspection, and remove dry-run. Then run confirmed default removal, which stops/unlists only the exact owned name and does not request data deletion.
+6. Prove the workspace, record, container, project network/volume, isolated registration, retained disposable branch, config source, clone, and any exact unreferenced project-built image are removed. Confirm the normal DDEV registry and all pre-existing project container identities are unchanged.
 
 ---
 
@@ -488,9 +489,9 @@ Exit code `0` means the requested outcome is ready or completed. Exit code `1` m
 
 ### Sources and Research
 
-- Current Filebean evidence (read-only, 2026-08-27): HEAD `23c6664417323023300ae18b4ec992392129aa7c` is a documentation branch 33 commits behind its upstream; `git ls-remote --symref origin HEAD` advertises `refs/heads/main` at locally present `1a9d97d09412014ed980b4ade717862b89631ef7`; worktree output contains detached, occupied, and prunable entries. `.ddev/config.yaml` establishes a repository-root DDEV app with `docroot: apps/laravel/public` and `composer_root: apps/laravel`. `package.json` and `apps/laravel/composer.json` establish `pnpm setup`, `ddev composer setup`, environment copy/key generation, migrations, and the build. The ignored `.env`, `vendor`, root `node_modules`, and build manifest exist only in the prepared checkout; current `.worktrees/` is not ignored.
-- Current barn2site evidence (read-only, 2026-08-27): HEAD is `f6105271596dac35673087bf4d26a1e6187a8032`; the remote advertises `refs/heads/master` at locally present `e2e7ac38dfcd2c02a3d68d17ef2b930998d4e6ab`. `git ls-files -v` exposes four skip-worktree entries, and tracked `wp-content/mu-plugins/maintenance.php` is physically absent. `.gitmodules` contains eleven top-level gitlinks, mostly private GitHub SSH URLs; recursive status shows nested `email-capture/util` and uninitialized `vendor/barn2/php-standards`. `.ddev/` and uploads are ignored, while root, mu-plugin, theme, and theme-build manifests prove only cwd-specific commands should run. Worktree output includes prunable metadata.
-- Current DDEV evidence (read-only, v1.25.3): JSON list output shows Filebean registered to `/Users/alessandrotesoro/.codex/worktrees/cecd/app.filebean`, three deleted temporary Filebean paths with failed Mutagen status, barn2site registered to its primary checkout, and another project with Mutagen problems. `ddev stop --help` proves stop/unlist is non-destructive and `--remove-data` snapshots unless explicitly omitted.
+- Current Documentably evidence (2026-08-29): remote `HEAD` advertised `refs/heads/main` at `0bc83fc1f5f410de2a2e45d503152078ca32beed`; the repository requires Node `>=22.12.0`, pins `pnpm@10.34.5`, tracks its lockfile and CLI launcher, and ignores `node_modules`, Turbo output, and package `dist` directories. `packages/cli/dist/index.js` is the precise manual-build artifact. Root tracked dotfiles include `.agents`, `.codex`, `.github`, `.gitignore`, and `.mcp.json`. The disposable source-only lifecycle, manual pinned install/build, list/doctor readiness, and exact removal passed without changing the normal checkout.
+- Current Posts Table Pro evidence (2026-08-29): remote `HEAD` advertised `refs/heads/master` at `6ed8023b236ac3819060760036dfc5c45e19359c`; the tracked WordPress-plugin entrypoint is `posts-data-table-pro.php`, dependencies needed for the minimal runtime are already tracked, and there are no submodules, LFS paths, symlinks, or tracked DDEV files. A separate clone outside the parent DDEV application passed explicit file publication, exact DDEV name/path/running checks, list/doctor, and confirmed removal with the database and Mutagen omitted. No uploads, snapshots, secrets, existing registration, normal checkout, or retained pilot resource was used.
+- Current DDEV evidence (read-only, v1.25.3): JSON list output exposes exact name, app root, status, and Mutagen fields. The global configuration location can be isolated with `DDEV_XDG_CONFIG_HOME`; project config supports database omission and disabled performance mode; global config supports router/SSH-agent omission and snapshot suppression. `ddev stop --unlist` is the exact non-data-deleting cleanup path.
 - Current workspace-manager evidence: `README.md`, `specs.md`, and `main.go` demonstrate unsafe patterns v1 excludes, including HEAD fallback, automatic push, four-character DDEV names, assume-unchanged mutation, forced removal, branch deletion, and global Docker pruning.
 - [Git worktree documentation](https://git-scm.com/docs/git-worktree), [Git rev-parse](https://git-scm.com/docs/git-rev-parse), [Git ls-files](https://git-scm.com/docs/git-ls-files), [Git submodule](https://git-scm.com/docs/git-submodule), and [Git check-attr](https://git-scm.com/docs/git-check-attr) define the command boundaries used by KTD1-KTD3.
 - [DDEV configuration](https://docs.ddev.com/en/stable/users/configuration/config/), [DDEV commands](https://docs.ddev.com/en/stable/users/usage/commands/), and [DDEV project management](https://docs.ddev.com/en/stable/users/usage/managing-projects/) define local overrides, list output, Mutagen diagnostics, and destructive lifecycle distinctions.
@@ -500,10 +501,10 @@ Exit code `0` means the requested outcome is ready or completed. Exit code `1` m
 
 | Disposition | Mechanisms | Grounded reason |
 |---|---|---|
-| KEEP | Four commands; runnable/source-only distinction; strict project config; named files; shell-free commands; submodules; conditional LFS diagnosis; exact DDEV identity; ownership record; dry-run; confirmation; fake runner; temporary Git fixtures; two pilots | Each maps to an explicit user requirement, a reproduced Filebean/barn2site failure, or an authoritative destructive-operation boundary. |
+| KEEP | Four commands; runnable/source-only distinction; strict project config; named files; shell-free commands; submodules; conditional LFS diagnosis; exact DDEV identity; ownership record; dry-run; confirmation; fake runner; temporary Git fixtures; two pilots | Each maps to an explicit user requirement, a replacement-pilot production workflow, or an authoritative destructive-operation boundary. |
 | REDUCE | Default-base resolution; tracked-content verification; readiness checks; Mutagen fixtures; orchestration tests | Query remote HEAD but never fetch; delegate content/mode/filter comparison to Git; keep only path and env-key checks; test representative non-`ok` Mutagen values; test phase boundaries instead of every combinatorial terminal state. |
 | REMOVE | Implicit base fetch; independent per-file blob hashing; ownership config digest; arbitrary command-style readiness checks; LFS network download; `ddev delete` | These duplicated an owning tool, mutated source-repository metadata, created a second command mechanism, or crossed the proven ownership boundary without a pilot need. |
-| DEFER | Retry/resume convenience; Linux/Windows qualification; DLA, Documentably, Grepzilla, and licensing-worker configs | They are useful only after the two accepted pilots and are not v1 implementation requirements. |
+| DEFER | Retry/resume convenience; Linux/Windows qualification; persisted project configs beyond the temporary acceptance inputs | They are not v1 implementation requirements. |
 
 ### Final Complexity Budget
 
@@ -522,7 +523,7 @@ Exit code `0` means the requested outcome is ready or completed. Exit code `1` m
 - Source readiness cannot pass with sparse omissions, hidden index flags, missing or mismatched tracked paths, unresolved gitlinks, or pointer-only required LFS content.
 - Full readiness cannot pass with missing declared files or checks, a failed preparation command, mismatched DDEV identity, stopped DDEV, or unhealthy Mutagen.
 - Automated verification passes on stable Rust without DDEV, Docker, network, private credentials, or real-project mutation.
-- Filebean and barn2site pilot procedures pass under separately authorized, disposable workspace names.
+- Documentably source-only/manual-build and Posts Table Pro disposable-DDEV pilot procedures pass under unique temporary identities, and every pilot resource is removed.
 - No production dependency remains unjustified after the manual Cargo alternatives evaluation.
 - No daemon, server, plugin architecture, central registry, database, async runtime, global cleanup, secret copier, source-project adapter family, remote push, or workspace-manager compatibility code exists.
 - The implementation diff contains no abandoned experiment, generated test residue, pilot state, worktree, DDEV registration, or source-project change.

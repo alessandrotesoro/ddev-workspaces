@@ -5,6 +5,49 @@ use std::fs;
 use support::{commit, init_repo, run_cli_with_path_and_vars, run_git, stdout};
 
 #[test]
+fn doctor_does_not_let_ddev_prune_the_real_project_registry() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n",
+    );
+    commit(repository.path(), "add DDEV fixture");
+
+    let global_home = tempfile::tempdir().expect("fake DDEV global home");
+    let global_dir = global_home.path().join("ddev");
+    fs::create_dir(&global_dir).expect("fake DDEV global directory");
+    let registry = global_dir.join("project_list.yaml");
+    fs::write(&registry, "stale registration must remain\n").expect("fake DDEV registry");
+    let fake_bin = support::fake_pruning_ddev_directory();
+
+    let output = run_cli_with_path_and_vars(
+        repository.path(),
+        &["doctor"],
+        fake_bin.path(),
+        &[
+            (
+                "DDEV_XDG_CONFIG_HOME",
+                global_home.path().to_str().expect("global home path"),
+            ),
+            (
+                "DDEV_FAKE_GLOBAL_DIR",
+                global_dir.to_str().expect("global directory path"),
+            ),
+        ],
+    );
+
+    assert!(output.status.success(), "{}", support::stderr(&output));
+    assert!(
+        stdout(&output).contains("stale DDEV registration points to missing path /missing/control")
+    );
+    assert_eq!(
+        fs::read_to_string(registry).expect("original registry remains"),
+        "stale registration must remain\n"
+    );
+}
+
+#[test]
 fn full_creation_and_default_removal_use_the_exact_fake_identity() {
     let repository = init_repo();
     support::write_tracked_file(
