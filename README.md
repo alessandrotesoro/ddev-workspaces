@@ -17,6 +17,7 @@ and the project configuration is a finite, strict TOML file.
 ## Release planning
 
 - [v0.1.0 macOS ARM release plan](docs/plans/2026-08-29-1932-feat-v0-1-0-macos-arm-release-plan.md)
+- [Permanent project configuration rollout plan](docs/plans/2026-08-29-2232-feat-permanent-project-config-rollout-plan.md)
 
 ## Build and install locally
 
