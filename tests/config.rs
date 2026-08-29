@@ -9,7 +9,7 @@ fn doctor_reports_unknown_configuration_fields_without_mutation() {
     let repository = init_repo();
     fs::write(
         repository.path().join(".ddev-workspaces.toml"),
-        "version = 1\nproject_id = 'filebean'\nworkspace_root = '.worktrees'\nfuture = true\n",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\nfuture = true\n",
     )
     .expect("configuration file");
 
@@ -27,7 +27,7 @@ fn doctor_accepts_a_strict_minimal_configuration_when_workspace_root_is_ignored(
     let repository = init_repo();
     fs::write(
         repository.path().join(".ddev-workspaces.toml"),
-        "version = 1\nproject_id = 'filebean'\nworkspace_root = '.worktrees'\n",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n",
     )
     .expect("configuration file");
 

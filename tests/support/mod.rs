@@ -148,8 +148,9 @@ pub fn fake_ddev_directory(state: &Path) -> TempDir {
     let bin = tempdir().expect("fake command directory");
     let script = bin.path().join("ddev");
     let contents = format!(
-        "#!/bin/sh\nset -eu\nif [ -n \"${{DDEV_FAKE_LOG:-}}\" ]; then\n  printf '%s\\n' \"$*\" >> \"$DDEV_FAKE_LOG\"\nfi\nif [ \"$1\" = \"list\" ]; then\n  if [ -f \"{state}\" ]; then\n    printf '{{\"raw\":[{{\"name\":\"%s\",\"approot\":\"%s\",\"status\":\"%s\",\"mutagen_enabled\":%s,\"mutagen_status\":\"%s\"}}]}}' \"$DDEV_FAKE_NAME\" \"$PWD\" \"${{DDEV_FAKE_STATUS:-running}}\" \"${{DDEV_FAKE_MUTAGEN_ENABLED:-false}}\" \"${{DDEV_FAKE_MUTAGEN_STATUS:-}}\"\n  else\n    printf '{{\"raw\":[]}}'\n  fi\n  exit 0\nfi\nif [ \"$1\" = \"start\" ]; then\n  : > \"{state}\"\n  exit 0\nfi\nif [ \"$1\" = \"stop\" ]; then\n  rm -f \"{state}\"\n  exit 0\nfi\nexit 0\n",
-        state = state.display()
+        "#!/bin/sh\nset -eu\nif [ -n \"${{DDEV_FAKE_LOG:-}}\" ]; then\n  printf '%s\\n' \"$*\" >> \"$DDEV_FAKE_LOG\"\nfi\nif [ \"$1\" = \"version\" ]; then\n  printf '{{\"raw\":{{\"global-ddev-dir\":\"{global_dir}\"}}}}'\n  exit 0\nfi\nif [ \"$1\" = \"list\" ]; then\n  if [ -f \"{state}\" ]; then\n    printf '{{\"raw\":[{{\"name\":\"%s\",\"approot\":\"%s\",\"status\":\"%s\",\"mutagen_enabled\":%s,\"mutagen_status\":\"%s\"}}]}}' \"$DDEV_FAKE_NAME\" \"$PWD\" \"${{DDEV_FAKE_STATUS:-running}}\" \"${{DDEV_FAKE_MUTAGEN_ENABLED:-false}}\" \"${{DDEV_FAKE_MUTAGEN_STATUS:-}}\"\n  else\n    printf '{{\"raw\":[]}}'\n  fi\n  exit 0\nfi\nif [ \"$1\" = \"start\" ]; then\n  : > \"{state}\"\n  exit 0\nfi\nif [ \"$1\" = \"stop\" ]; then\n  rm -f \"{state}\"\n  exit 0\nfi\nexit 0\n",
+        state = state.display(),
+        global_dir = state.parent().expect("fake DDEV state parent").display()
     );
     fs::write(&script, contents).expect("fake ddev script");
     #[cfg(unix)]
@@ -160,6 +161,39 @@ pub fn fake_ddev_directory(state: &Path) -> TempDir {
             .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).expect("fake ddev permissions");
+    }
+    bin
+}
+
+pub fn fake_pruning_ddev_directory() -> TempDir {
+    let bin = tempdir().expect("fake command directory");
+    let script = bin.path().join("ddev");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+if [ "$1" = "version" ]; then
+  printf '{"raw":{"global-ddev-dir":"%s"}}' "$DDEV_FAKE_GLOBAL_DIR"
+  exit 0
+fi
+if [ "$1" = "list" ]; then
+  : > "$DDEV_XDG_CONFIG_HOME/ddev/project_list.yaml"
+  printf '%s\n' '{"level":"warning","msg":"The project '\''/missing/control'\'' no longer exists in the filesystem, removing it from registry"}' >&2
+  printf '{"raw":[]}'
+  exit 0
+fi
+exit 0
+"#,
+    )
+    .expect("fake pruning ddev script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&script)
+            .expect("fake pruning ddev metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("fake pruning ddev permissions");
     }
     bin
 }

@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -22,6 +23,32 @@ struct DdevListEnvelope {
     raw: Vec<DdevProject>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DdevVersionEnvelope {
+    raw: DdevVersion,
+}
+
+#[derive(Debug, Deserialize)]
+struct DdevVersion {
+    #[serde(rename = "global-ddev-dir")]
+    global_dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct DdevOutputMessage {
+    msg: String,
+}
+
+struct DdevListShadow {
+    xdg_home: PathBuf,
+}
+
+impl Drop for DdevListShadow {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.xdg_home);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdevInspection {
     pub entries: Vec<DdevProject>,
@@ -41,7 +68,13 @@ pub fn expected_name(project_id: &str, workspace_name: &str) -> ToolResult<Strin
 }
 
 pub fn list<R: CommandRunner>(runner: &mut R, cwd: &Path) -> ToolResult<DdevInspection> {
-    let request = CommandRequest::new("ddev", ["list", "--json-output"]).cwd(cwd);
+    let shadow = prepare_list_shadow(runner, cwd)?;
+    let request = CommandRequest::new("ddev", ["list", "--json-output"])
+        .cwd(cwd)
+        .env(
+            "DDEV_XDG_CONFIG_HOME",
+            shadow.xdg_home.to_string_lossy().into_owned(),
+        );
     let output = runner.run(&request)?;
     if !output.success() {
         return Err(ToolError::new(
@@ -53,7 +86,22 @@ pub fn list<R: CommandRunner>(runner: &mut R, cwd: &Path) -> ToolResult<DdevInsp
             "DDEV returned an unsupported JSON list envelope: {error}; upgrade guidance is required before mutation"
         ))
     })?;
-    let mut warnings = Vec::new();
+    let mut warnings = output
+        .stderr
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                None
+            } else {
+                Some(normalize_ddev_warning(
+                    serde_json::from_str::<DdevOutputMessage>(line)
+                        .map(|message| message.msg)
+                        .unwrap_or_else(|_| line.to_owned()),
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
     for entry in &envelope.raw {
         if !Path::new(&entry.approot).exists() {
             warnings.push(format!(
@@ -84,6 +132,79 @@ pub fn list<R: CommandRunner>(runner: &mut R, cwd: &Path) -> ToolResult<DdevInsp
         entries: envelope.raw,
         warnings,
     })
+}
+
+fn normalize_ddev_warning(message: String) -> String {
+    const PREFIX: &str = "The project '";
+    const SUFFIX: &str = "' no longer exists in the filesystem, removing it from registry";
+    if let Some(path) = message
+        .strip_prefix(PREFIX)
+        .and_then(|message| message.strip_suffix(SUFFIX))
+    {
+        format!("stale DDEV registration points to missing path {path}")
+    } else {
+        message
+    }
+}
+
+fn prepare_list_shadow<R: CommandRunner>(runner: &mut R, cwd: &Path) -> ToolResult<DdevListShadow> {
+    let version =
+        runner.run(&CommandRequest::new("ddev", ["version", "--json-output"]).cwd(cwd))?;
+    if !version.success() {
+        return Err(ToolError::new(
+            "DDEV version inspection failed; verify that DDEV is installed and retry the read-only diagnosis",
+        ));
+    }
+    let envelope = serde_json::from_str::<DdevVersionEnvelope>(&version.stdout).map_err(|error| {
+        ToolError::new(format!(
+            "DDEV returned an unsupported JSON version envelope: {error}; upgrade guidance is required before inspection"
+        ))
+    })?;
+    if !envelope.raw.global_dir.is_absolute() {
+        return Err(ToolError::new(
+            "DDEV reported a non-absolute global configuration directory; refusing inspection",
+        ));
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ToolError::new(format!("system clock error: {error}")))?
+        .as_nanos();
+    let xdg_home = std::env::temp_dir().join(format!(
+        "ddev-workspaces-list-{}-{nonce}",
+        std::process::id()
+    ));
+    let shadow_dir = xdg_home.join("ddev");
+    fs::create_dir_all(&shadow_dir).map_err(|error| {
+        ToolError::new(format!(
+            "could not create isolated DDEV inspection directory: {error}"
+        ))
+    })?;
+    let shadow = DdevListShadow { xdg_home };
+
+    for filename in ["global_config.yaml", "project_list.yaml"] {
+        let source = envelope.raw.global_dir.join(filename);
+        if source.is_file() {
+            fs::copy(&source, shadow_dir.join(filename)).map_err(|error| {
+                ToolError::new(format!(
+                    "could not isolate DDEV {filename} for read-only inspection: {error}"
+                ))
+            })?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let source = envelope.raw.global_dir.join("bin");
+        if source.is_dir() {
+            std::os::unix::fs::symlink(source, shadow_dir.join("bin")).map_err(|error| {
+                ToolError::new(format!(
+                    "could not expose DDEV helper binaries to isolated inspection: {error}"
+                ))
+            })?;
+        }
+    }
+
+    Ok(shadow)
 }
 
 pub fn inspect_new_identity(
@@ -296,9 +417,9 @@ mod tests {
 
     #[test]
     fn names_are_deterministic_and_limited_to_dns_label_size() {
-        let name = expected_name("filebean", "invoice-fix").expect("valid DDEV name");
+        let name = expected_name("fixture", "invoice-fix").expect("valid DDEV name");
 
-        assert_eq!(name, "dw-filebean--invoice-fix");
+        assert_eq!(name, "dw-fixture--invoice-fix");
         assert!(expected_name(&"a".repeat(60), "task").is_err());
     }
 
@@ -306,7 +427,7 @@ mod tests {
     fn exact_identity_requires_running_and_healthy_mutagen() {
         let inspection = DdevInspection {
             entries: vec![DdevProject {
-                name: "dw-filebean--task".to_owned(),
+                name: "dw-fixture--task".to_owned(),
                 approot: "/tmp/workspace".to_owned(),
                 status: "running".to_owned(),
                 mutagen_enabled: true,
@@ -317,19 +438,19 @@ mod tests {
 
         let project = require_ready_identity(
             &inspection,
-            "dw-filebean--task",
+            "dw-fixture--task",
             &PathBuf::from("/tmp/workspace"),
         )
         .expect("identity should be ready");
 
-        assert_eq!(project.name, "dw-filebean--task");
+        assert_eq!(project.name, "dw-fixture--task");
     }
 
     #[test]
     fn conflicting_name_or_path_is_rejected_before_start() {
         let inspection = DdevInspection {
             entries: vec![DdevProject {
-                name: "dw-filebean--other".to_owned(),
+                name: "dw-fixture--other".to_owned(),
                 approot: "/tmp/workspace".to_owned(),
                 status: "running".to_owned(),
                 mutagen_enabled: false,
@@ -340,7 +461,7 @@ mod tests {
 
         let error = inspect_new_identity(
             &inspection,
-            "dw-filebean--task",
+            "dw-fixture--task",
             &PathBuf::from("/tmp/workspace"),
         )
         .unwrap_err();
@@ -370,7 +491,7 @@ mod tests {
 
         stop_unlist(
             Path::new("/tmp/workspace"),
-            "dw-filebean--task",
+            "dw-fixture--task",
             true,
             &mut runner,
         )
@@ -382,7 +503,7 @@ mod tests {
                 "stop".to_owned(),
                 "--remove-data".to_owned(),
                 "--unlist".to_owned(),
-                "dw-filebean--task".to_owned()
+                "dw-fixture--task".to_owned()
             ]
         );
         assert!(!runner.requests[0].args.iter().any(|arg| arg == "delete"));

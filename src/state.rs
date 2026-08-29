@@ -258,12 +258,12 @@ mod tests {
     fn record(directory: &Path) -> OwnershipRecord {
         OwnershipRecord {
             version: 1,
-            project_id: "filebean".to_owned(),
+            project_id: "fixture".to_owned(),
             common_directory: directory.display().to_string(),
             worktree_path: directory.join(".worktrees/task-1").display().to_string(),
             base_sha: "0123456789012345678901234567890123456789".to_owned(),
             branch: "task-1".to_owned(),
-            ddev_name: "dw-filebean--task-1".to_owned(),
+            ddev_name: "dw-fixture--task-1".to_owned(),
         }
     }
 
@@ -288,7 +288,7 @@ mod tests {
         fs::create_dir_all(path.parent().expect("record parent")).expect("record parent");
         fs::write(
             &path,
-            "version = 1\nproject_id = 'filebean'\ncommon_directory = '/tmp'\nworktree_path = '/tmp/task-1'\nbase_sha = '0123456789012345678901234567890123456789'\nbranch = 'task-1'\nddev_name = 'dw-filebean--task-1'\nfuture = true\n",
+            "version = 1\nproject_id = 'fixture'\ncommon_directory = '/tmp'\nworktree_path = '/tmp/task-1'\nbase_sha = '0123456789012345678901234567890123456789'\nbranch = 'task-1'\nddev_name = 'dw-fixture--task-1'\nfuture = true\n",
         )
         .expect("record should be written");
 
