@@ -185,9 +185,13 @@ fn list(_arguments: &ArgMatches) -> ToolResult<u8> {
         .as_ref()
         .err()
         .filter(|error| !error.to_string().starts_with("configuration is required"));
-    let ddev_inspection = config
-        .filter(|config| config.ddev.is_some())
-        .map(|_| ddev::list(&mut runner, manager_root));
+    let needs_ddev_inspection = entries.iter().any(|entry| {
+        entry
+            .record
+            .as_ref()
+            .is_ok_and(|record| !record.source_only && record.ddev_app_root.is_some())
+    });
+    let ddev_inspection = needs_ddev_inspection.then(|| ddev::list(&mut runner, manager_root));
     if let Some(Ok(inspection)) = &ddev_inspection {
         for warning in &inspection.warnings {
             println!("DDEV: {warning}");
@@ -353,12 +357,26 @@ fn print_list_entry<R: CommandRunner>(
         println!("{}: NOT READY — {error}", entry.name);
         return false;
     }
-    let Some(config) = config else {
+    if record.source_only {
+        if record.ddev_app_root.is_some() {
+            println!(
+                "{}: INVALID RECORD — source-only ownership cannot include a DDEV app root",
+                entry.name
+            );
+            return false;
+        }
         println!(
-            "{}: SOURCE-ONLY — configuration is missing from the manager root",
+            "{}: SOURCE-ONLY — explicitly created without runtime preparation",
             entry.name
         );
         return true;
+    }
+    let Some(config) = config else {
+        println!(
+            "{}: NOT READY — configuration is missing from the manager root",
+            entry.name
+        );
+        return false;
     };
     let expected_name = match ddev::expected_name(&config.project_id, &entry.name) {
         Ok(expected_name) => expected_name,
@@ -375,17 +393,28 @@ fn print_list_entry<R: CommandRunner>(
         return false;
     }
     if let Some(reason) = runtime_precondition_failure(config, &path) {
-        println!("{}: SOURCE-ONLY — {reason}", entry.name);
-        return true;
+        println!("{}: NOT READY — {reason}", entry.name);
+        return false;
     }
-    let Some(ddev_config) = &config.ddev else {
+    let current_ddev_app_root = config
+        .ddev
+        .as_ref()
+        .map(|ddev_config| ddev_config.app_root.as_str());
+    if record.ddev_app_root.as_deref() != current_ddev_app_root {
+        println!(
+            "{}: NOT READY — current DDEV app root differs from creation provenance",
+            entry.name
+        );
+        return false;
+    }
+    let Some(recorded_app_root) = &record.ddev_app_root else {
         println!(
             "{}: READY — source and configured non-DDEV checks pass",
             entry.name
         );
         return true;
     };
-    let app_root = match config::safe_join(&path, &ddev_config.app_root) {
+    let app_root = match config::safe_join(&path, recorded_app_root) {
         Ok(app_root) => app_root,
         Err(error) => {
             println!("{}: NOT READY — {error}", entry.name);
@@ -422,10 +451,10 @@ fn print_list_entry<R: CommandRunner>(
         }
         Ok(None) => {
             println!(
-                "{}: SOURCE-ONLY — DDEV identity is not registered",
+                "{}: NOT READY — DDEV identity is not registered",
                 entry.name
             );
-            true
+            false
         }
         Err(error) => {
             println!("{}: NOT READY — {error}", entry.name);
@@ -487,6 +516,15 @@ fn create(arguments: &ArgMatches) -> ToolResult<u8> {
         base_sha: base.sha.clone(),
         branch: name.to_owned(),
         ddev_name,
+        source_only,
+        ddev_app_root: if source_only {
+            None
+        } else {
+            project_config
+                .ddev
+                .as_ref()
+                .map(|ddev_config| ddev_config.app_root.clone())
+        },
     };
     let record_path = state::reserve(&repository.common_dir, &record)?;
     match create_after_reservation(
@@ -659,14 +697,9 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
         &current_record,
         &mut runner,
     )?;
-    if current.ddev.is_some() {
-        let ddev_config = current_config
-            .ddev
-            .as_ref()
-            .ok_or_else(|| ToolError::new("DDEV identity was found without DDEV configuration"))?;
-        let app_root = config::safe_join(&current.path, &ddev_config.app_root)?;
+    if let Some((_, app_root)) = &current.ddev {
         ddev::stop_unlist(
-            &app_root,
+            app_root,
             &current_record.ddev_name,
             delete_data,
             &mut runner,
@@ -696,7 +729,7 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
 #[derive(Debug)]
 struct RemovalTarget {
     path: PathBuf,
-    ddev: Option<DdevProject>,
+    ddev: Option<(DdevProject, PathBuf)>,
 }
 
 fn reload_removal_state<R: CommandRunner>(
@@ -808,10 +841,16 @@ fn verify_removal_target<R: CommandRunner>(
     }
     repository.worktree_is_clean(&path, runner)?;
 
-    let ddev = if let Some(ddev_config) = &project_config.ddev {
-        let app_root = config::safe_join(&path, &ddev_config.app_root)?;
+    if record.source_only && record.ddev_app_root.is_some() {
+        return Err(ToolError::new(
+            "source-only ownership record unexpectedly includes a DDEV app root; refusing removal",
+        ));
+    }
+    let ddev = if let Some(recorded_app_root) = &record.ddev_app_root {
+        let app_root = config::safe_join(&path, recorded_app_root)?;
         let inspection = ddev::list(runner, &app_root)?;
         find_owned_ddev(&inspection.entries, &record.ddev_name, &app_root)?
+            .map(|project| (project, app_root))
     } else {
         None
     };
