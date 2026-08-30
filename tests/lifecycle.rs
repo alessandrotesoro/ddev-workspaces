@@ -178,6 +178,31 @@ fn list_ddev_identity_recomputes_source_only_status_without_scanning_other_repos
 }
 
 #[test]
+fn list_keeps_a_failed_full_creation_not_ready() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[[checks]]\nlabel = 'required artifact'\nkind = 'path-exists'\npath = 'missing-artifact'\n",
+    );
+    commit(repository.path(), "add failing runtime check");
+
+    let created = run_cli(
+        repository.path(),
+        &["create", "--base", "HEAD", "failed-full"],
+    );
+    assert_eq!(created.status.code(), Some(1));
+    assert!(repository.path().join(".worktrees/failed-full").exists());
+
+    let listed = run_cli(repository.path(), &["list"]);
+    let text = format!("{}{}", stdout(&listed), support::stderr(&listed));
+
+    assert_eq!(listed.status.code(), Some(1), "{text}");
+    assert!(text.contains("failed-full: NOT READY"), "{text}");
+    assert!(!text.contains("failed-full: SOURCE-ONLY"), "{text}");
+}
+
+#[test]
 fn doctor_on_a_linked_worktree_uses_the_manager_configuration() {
     let repository = init_repo();
     support::write_tracked_file(
@@ -339,7 +364,7 @@ fn main_worktree_alias_is_refused_even_with_a_record() {
     fs::write(
         record_directory.join("main.toml"),
         format!(
-            "version = 1\nproject_id = 'fixture'\ncommon_directory = '{}'\nworktree_path = '{}'\nbase_sha = '{}'\nbranch = 'main'\nddev_name = 'dw-fixture--main'\n",
+            "version = 1\nproject_id = 'fixture'\ncommon_directory = '{}'\nworktree_path = '{}'\nbase_sha = '{}'\nbranch = 'main'\nddev_name = 'dw-fixture--main'\nsource_only = true\n",
             fs::canonicalize(repository.path().join(".git"))
                 .expect("canonical common directory")
                 .display(),

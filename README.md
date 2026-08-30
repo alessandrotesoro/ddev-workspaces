@@ -91,8 +91,10 @@ configuration so DDEV cannot prune the user's registry during diagnosis.
 `--base`, it queries `origin`'s advertised symbolic `HEAD` and requires that
 full commit to be present locally. It never fetches, pushes, adopts an
 existing branch, or uses the current `HEAD` as a fallback. The ownership
-record is reserved before the Git worktree is created. Once reserved, any
-failure preserves the record and worktree for diagnosis.
+record is reserved before the Git worktree is created. It records immutable
+creation mode and the original DDEV app root, when any, so later status and
+cleanup do not guess from mutable configuration. Once reserved, any failure
+preserves the record and worktree for diagnosis.
 
 `create --source-only NAME` performs Git worktree, tracked-source, submodule,
 and local LFS preparation, then skips files, commands, readiness checks, and
@@ -102,11 +104,14 @@ it creates no branch, path, file, ownership record, or DDEV state.
 `list` reads only ownership records under the current repository's Git common
 directory and recomputes compact source/runtime status. It does not scan
 other repositories. It returns success when every entry is ready or
-source-only, and returns `1` when an entry is invalid or not ready.
+explicitly source-only, and returns `1` when an entry is invalid or not
+ready. A failed full creation never becomes source-only merely because its
+runtime prerequisites are incomplete.
 
 `remove NAME` requires a valid tool-owned record, the exact canonical path and
-Git worktree, a clean and unlocked worktree, and an exact DDEV identity when
-one is present. In a non-interactive terminal, pass `--confirm NAME`. Default
+Git worktree, a clean and unlocked worktree, and the exact originally recorded
+DDEV identity when one is present, even if current configuration changed. In a
+non-interactive terminal, pass `--confirm NAME`. Default
 cleanup issues only `ddev stop --unlist <exact-name>`, removes the worktree
 without force, retains the branch and DDEV data, and removes the ownership
 record last. `--delete-ddev-data` additionally requires

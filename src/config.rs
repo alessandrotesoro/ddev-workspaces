@@ -535,4 +535,209 @@ mod tests {
         assert!(validate_repository_relative("app_root", ".").is_ok());
         assert!(validate_workspace_relative("check", ".").is_ok());
     }
+
+    #[test]
+    fn missing_and_malformed_configuration_report_the_named_file() {
+        let directory = tempdir().expect("temporary directory");
+
+        let missing = ProjectConfig::load(directory.path()).unwrap_err();
+        fs::write(directory.path().join(CONFIG_FILE), "version = 'wrong'\n")
+            .expect("malformed configuration");
+        let malformed = ProjectConfig::load(directory.path()).unwrap_err();
+
+        assert!(missing.to_string().contains(CONFIG_FILE));
+        assert!(missing.to_string().contains("configuration is required"));
+        assert!(malformed.to_string().contains(CONFIG_FILE));
+        assert!(malformed.to_string().contains("invalid configuration"));
+    }
+
+    #[test]
+    fn names_and_relative_paths_enforce_the_documented_grammar() {
+        for invalid in [
+            "",
+            "Upper",
+            "-leading",
+            "trailing-",
+            "two--dashes",
+            "space here",
+        ] {
+            assert!(
+                validate_name("workspace name", invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        for invalid in ["", "/absolute", "../escape", "a/../../escape", "a/.."] {
+            assert!(
+                validate_repository_relative("path", invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(validate_name("workspace name", "task-42").is_ok());
+        assert!(validate_repository_relative("path", "a/../b").is_ok());
+    }
+
+    #[test]
+    fn file_command_and_check_rules_reject_invalid_public_configuration() {
+        let directory = tempdir().expect("temporary directory");
+        fs::create_dir(directory.path().join(".worktrees")).expect("workspace root");
+        let validate = |config: &ProjectConfig| {
+            config
+                .validate(
+                    directory.path(),
+                    &mut IgnoreRunner {
+                        ignored: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err()
+                .to_string()
+        };
+
+        let mut empty_file_label = valid_config();
+        empty_file_label.files.push(FileRule {
+            label: " ".to_owned(),
+            destination: ".env".to_owned(),
+            template: Some("example.env".to_owned()),
+            source_env: None,
+        });
+        assert!(validate(&empty_file_label).contains("files[].label"));
+
+        let mut missing_source = valid_config();
+        missing_source.files.push(FileRule {
+            label: "environment".to_owned(),
+            destination: ".env".to_owned(),
+            template: None,
+            source_env: None,
+        });
+        assert!(validate(&missing_source).contains("exactly one"));
+
+        let mut invalid_source_name = valid_config();
+        invalid_source_name.files.push(FileRule {
+            label: "environment".to_owned(),
+            destination: ".env".to_owned(),
+            template: None,
+            source_env: Some("1INVALID".to_owned()),
+        });
+        assert!(validate(&invalid_source_name).contains("variable name"));
+
+        let mut empty_command_label = valid_config();
+        empty_command_label.commands.push(CommandRule {
+            label: "".to_owned(),
+            cwd: ".".to_owned(),
+            argv: vec!["true".to_owned()],
+            sensitive: false,
+        });
+        assert!(validate(&empty_command_label).contains("commands[].label"));
+
+        let mut empty_argv = valid_config();
+        empty_argv.commands.push(CommandRule {
+            label: "setup".to_owned(),
+            cwd: ".".to_owned(),
+            argv: vec![String::new()],
+            sensitive: false,
+        });
+        assert!(validate(&empty_argv).contains("non-empty argv"));
+
+        for (kind, key, expected) in [
+            ("path-exists", Some("KEY"), "cannot define"),
+            ("env-key", None, "requires"),
+            ("future-kind", None, "unsupported"),
+        ] {
+            let mut invalid_check = valid_config();
+            invalid_check.checks.push(CheckRule {
+                label: "health".to_owned(),
+                kind: kind.to_owned(),
+                path: ".env".to_owned(),
+                key: key.map(str::to_owned),
+            });
+            assert!(validate(&invalid_check).contains(expected));
+        }
+
+        let mut valid = valid_config();
+        valid.files.push(FileRule {
+            label: "environment".to_owned(),
+            destination: ".env".to_owned(),
+            template: Some("example.env".to_owned()),
+            source_env: None,
+        });
+        valid.commands.push(CommandRule {
+            label: "setup".to_owned(),
+            cwd: ".".to_owned(),
+            argv: vec!["true".to_owned()],
+            sensitive: false,
+        });
+        valid.checks.push(CheckRule {
+            label: "environment".to_owned(),
+            kind: "env-key".to_owned(),
+            path: ".env".to_owned(),
+            key: Some("APP_KEY".to_owned()),
+        });
+        assert!(
+            valid
+                .validate(
+                    directory.path(),
+                    &mut IgnoreRunner {
+                        ignored: true,
+                        ..Default::default()
+                    }
+                )
+                .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_paths_reject_symlink_escape_and_symlinked_ddev_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempdir().expect("repository");
+        let outside = tempdir().expect("outside directory");
+        symlink(outside.path(), repository.path().join("linked")).expect("escape symlink");
+
+        let error = safe_join(repository.path(), "linked/file").unwrap_err();
+        assert!(error.to_string().contains("through a symlink"));
+        assert_eq!(
+            nearest_existing_parent(&repository.path().join("missing/child")),
+            repository.path()
+        );
+
+        fs::create_dir(repository.path().join(".worktrees")).expect("workspace root");
+        fs::create_dir(repository.path().join("app")).expect("app root");
+        symlink(outside.path(), repository.path().join("app/.ddev")).expect("DDEV symlink");
+        let mut config = valid_config();
+        config.ddev = Some(DdevConfig {
+            app_root: "app".to_owned(),
+        });
+        let error = config
+            .validate(
+                repository.path(),
+                &mut IgnoreRunner {
+                    ignored: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("symlinked .ddev"));
+    }
+
+    #[test]
+    fn git_ignore_probe_is_repository_relative_and_outside_paths_are_rejected() {
+        let repository = tempdir().expect("repository");
+        let outside = tempdir().expect("outside directory");
+        let mut runner = IgnoreRunner {
+            ignored: true,
+            ..Default::default()
+        };
+
+        assert!(
+            is_ignored(
+                repository.path(),
+                &repository.path().join(".worktrees/probe"),
+                &mut runner
+            )
+            .expect("ignore probe")
+        );
+        assert_eq!(runner.requests.borrow()[0].program, "git");
+        assert!(is_ignored(repository.path(), outside.path(), &mut runner).is_err());
+    }
 }

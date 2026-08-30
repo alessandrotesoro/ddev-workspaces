@@ -2,13 +2,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::command::{ToolError, ToolResult};
 
 pub const STATE_DIRECTORY: &str = "ddev-workspaces/workspaces";
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OwnershipRecord {
     pub version: u32,
@@ -18,6 +18,8 @@ pub struct OwnershipRecord {
     pub base_sha: String,
     pub branch: String,
     pub ddev_name: String,
+    pub source_only: bool,
+    pub ddev_app_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +39,7 @@ pub fn record_path(common_directory: &Path, name: &str) -> PathBuf {
 pub fn reserve(common_directory: &Path, record: &OwnershipRecord) -> ToolResult<PathBuf> {
     ensure_records_directory(common_directory)?;
     let path = record_path(common_directory, &record.branch);
-    let contents = serialize_record(record);
+    let contents = toml::to_string(record)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -218,38 +220,6 @@ pub fn delete(path: &Path) -> ToolResult<()> {
     })
 }
 
-fn serialize_record(record: &OwnershipRecord) -> String {
-    format!(
-        "version = 1\nproject_id = {}\ncommon_directory = {}\nworktree_path = {}\nbase_sha = {}\nbranch = {}\nddev_name = {}\n",
-        toml_string(&record.project_id),
-        toml_string(&record.common_directory),
-        toml_string(&record.worktree_path),
-        toml_string(&record.base_sha),
-        toml_string(&record.branch),
-        toml_string(&record.ddev_name),
-    )
-}
-
-fn toml_string(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\u{08}' => escaped.push_str("\\b"),
-            '\t' => escaped.push_str("\\t"),
-            '\n' => escaped.push_str("\\n"),
-            '\u{0c}' => escaped.push_str("\\f"),
-            '\r' => escaped.push_str("\\r"),
-            character if character.is_control() => {
-                escaped.push_str(&format!("\\u{:04X}", character as u32));
-            }
-            character => escaped.push(character),
-        }
-    }
-    format!("\"{escaped}\"")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +234,23 @@ mod tests {
             base_sha: "0123456789012345678901234567890123456789".to_owned(),
             branch: "task-1".to_owned(),
             ddev_name: "dw-fixture--task-1".to_owned(),
+            source_only: false,
+            ddev_app_root: Some(".".to_owned()),
         }
+    }
+
+    #[test]
+    fn ownership_record_round_trips_toml_sensitive_values() {
+        let directory = tempdir().expect("temporary directory");
+        let mut expected = record(directory.path());
+        expected.project_id = "quotes \" slashes \\ controls\u{08}\t\n\u{0c}\r\u{1f}".to_owned();
+        expected.branch = "unicode-λ".to_owned();
+
+        let encoded = toml::to_string(&expected).expect("serialize ownership record");
+        let decoded: OwnershipRecord =
+            toml::from_str(&encoded).expect("deserialize ownership record");
+
+        assert_eq!(decoded, expected);
     }
 
     #[test]
@@ -288,12 +274,96 @@ mod tests {
         fs::create_dir_all(path.parent().expect("record parent")).expect("record parent");
         fs::write(
             &path,
-            "version = 1\nproject_id = 'fixture'\ncommon_directory = '/tmp'\nworktree_path = '/tmp/task-1'\nbase_sha = '0123456789012345678901234567890123456789'\nbranch = 'task-1'\nddev_name = 'dw-fixture--task-1'\nfuture = true\n",
+            "version = 1\nproject_id = 'fixture'\ncommon_directory = '/tmp'\nworktree_path = '/tmp/task-1'\nbase_sha = '0123456789012345678901234567890123456789'\nbranch = 'task-1'\nddev_name = 'dw-fixture--task-1'\nsource_only = false\nddev_app_root = '.'\nfuture = true\n",
         )
         .expect("record should be written");
 
         let error = load(directory.path(), "task-1").unwrap_err();
 
         assert!(error.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn listing_is_empty_until_records_exist_then_sorts_and_reports_invalid_records() {
+        let directory = tempdir().expect("temporary directory");
+        assert!(list(directory.path()).expect("empty listing").is_empty());
+
+        let mut second = record(directory.path());
+        second.branch = "second".to_owned();
+        reserve(directory.path(), &second).expect("second record");
+        let mut first = record(directory.path());
+        first.branch = "first".to_owned();
+        reserve(directory.path(), &first).expect("first record");
+        fs::write(
+            records_directory(directory.path()).join("ignored.txt"),
+            "ignored",
+        )
+        .expect("non-record file");
+        fs::write(
+            records_directory(directory.path()).join("invalid.toml"),
+            "version = 2\n",
+        )
+        .expect("invalid record");
+
+        let entries = list(directory.path()).expect("record listing");
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "invalid", "second"]
+        );
+        assert!(entries[0].record.is_ok());
+        assert!(entries[1].record.is_err());
+        assert!(entries[2].record.is_ok());
+    }
+
+    #[test]
+    fn missing_and_unsupported_records_are_never_loaded_or_deleted_as_owned() {
+        let directory = tempdir().expect("temporary directory");
+        assert!(load(directory.path(), "missing").is_err());
+
+        let mut unsupported = record(directory.path());
+        unsupported.version = 2;
+        let path = reserve(directory.path(), &unsupported).expect("unsupported record fixture");
+        assert!(
+            load(directory.path(), "task-1")
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported version 2")
+        );
+
+        delete(&path).expect("record deletion");
+        assert!(!path.exists());
+        assert!(delete(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ownership_directories_and_records_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary directory");
+        let outside = tempdir().expect("outside directory");
+        fs::create_dir(directory.path().join("ddev-workspaces"))
+            .expect("ownership manager directory");
+        symlink(
+            outside.path(),
+            directory.path().join("ddev-workspaces/workspaces"),
+        )
+        .expect("ownership directory symlink");
+
+        assert!(reserve(directory.path(), &record(directory.path())).is_err());
+        assert!(list(directory.path()).is_err());
+
+        fs::remove_file(directory.path().join("ddev-workspaces/workspaces"))
+            .expect("remove ownership symlink");
+        fs::create_dir(directory.path().join("ddev-workspaces/workspaces"))
+            .expect("ownership directory");
+        let target = outside.path().join("record.toml");
+        fs::write(&target, "version = 1\n").expect("record target");
+        symlink(&target, record_path(directory.path(), "task-1")).expect("record symlink");
+        assert!(load(directory.path(), "task-1").is_err());
     }
 }

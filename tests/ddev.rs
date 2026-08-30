@@ -235,6 +235,63 @@ fn post_start_identity_failure_preserves_owned_state() {
 }
 
 #[test]
+fn removal_uses_creation_ddev_provenance_after_configuration_changes() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n",
+    );
+    support::write_tracked_file(repository.path(), ".ddev/config.yaml", "name: fixture\n");
+    commit(repository.path(), "add DDEV provenance fixture");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
+    let state = fake_state.path().join("running");
+    let fake_bin = support::fake_ddev_directory(&state);
+    let variables = [("DDEV_FAKE_NAME", "dw-fixture--provenance")];
+    let created = run_cli_with_path_and_vars(
+        repository.path(),
+        &["create", "--base", "HEAD", "provenance"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+    assert!(state.exists());
+
+    fs::write(
+        repository.path().join(".ddev-workspaces.toml"),
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n",
+    )
+    .expect("remove current DDEV configuration");
+    commit(repository.path(), "remove current DDEV configuration");
+
+    let listed =
+        run_cli_with_path_and_vars(repository.path(), &["list"], fake_bin.path(), &variables);
+    let listed_text = format!("{}{}", stdout(&listed), support::stderr(&listed));
+    assert_eq!(listed.status.code(), Some(1), "{listed_text}");
+    assert!(
+        listed_text.contains("current DDEV app root differs from creation provenance"),
+        "{listed_text}"
+    );
+
+    let removed = run_cli_with_path_and_vars(
+        repository.path(),
+        &["remove", "--confirm", "provenance", "provenance"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(removed.status.success(), "{}", support::stderr(&removed));
+    assert!(!state.exists());
+    assert!(!repository.path().join(".worktrees/provenance").exists());
+    assert!(
+        !repository
+            .path()
+            .join(".git/ddev-workspaces/workspaces/provenance.toml")
+            .exists()
+    );
+}
+
+#[test]
 fn create_dry_run_with_ddev_never_starts_or_reserves() {
     let repository = init_repo();
     support::write_tracked_file(
