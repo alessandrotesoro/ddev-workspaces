@@ -48,22 +48,38 @@ fn doctor(arguments: &ArgMatches) -> ToolResult<u8> {
         Ok(config) => {
             println!("Configuration: READY");
             let mut ready = true;
+            let mut source_only_ready = false;
             if let Some((record_name, record)) = &managed_record {
-                if let Err(error) =
-                    verify_removal_target(&repository, &config, record_name, record, &mut runner)
-                {
-                    println!("Ownership: NOT READY — {error}");
-                    ready = false;
-                }
-                if let Some(reason) = runtime_precondition_failure(&config, &repository.root) {
-                    println!("Runtime: NOT READY — {reason}");
-                    ready = false;
+                let ownership_ready = match verify_removal_target(
+                    &repository,
+                    &config,
+                    record_name,
+                    record,
+                    &mut runner,
+                ) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        println!("Ownership: NOT READY — {error}");
+                        ready = false;
+                        false
+                    }
+                };
+                source_only_ready = ownership_ready && record.source_only;
+                if source_only_ready {
+                    println!("Runtime: skipped by --source-only");
                 } else {
-                    println!("Runtime: READY");
+                    if let Some(reason) = runtime_precondition_failure(&config, &repository.root) {
+                        println!("Runtime: NOT READY — {reason}");
+                        ready = false;
+                    } else {
+                        println!("Runtime: READY");
+                    }
                 }
                 println!("Ownership: {}", record.ddev_name);
             }
-            if let Some(ddev_config) = &config.ddev {
+            if source_only_ready {
+                println!("DDEV: skipped by --source-only");
+            } else if let Some(ddev_config) = &config.ddev {
                 let app_root = config::safe_join(&repository.root, &ddev_config.app_root)?;
                 match ddev::list(&mut runner, &app_root) {
                     Ok(inspection) => {
@@ -485,6 +501,11 @@ fn create(arguments: &ArgMatches) -> ToolResult<u8> {
     repository.ensure_worktree_available(&workspace, name, &mut runner)?;
     if !source_only {
         validate_local_file_sources(&project_config)?;
+        for file in &project_config.files {
+            if let Some(template) = &file.template {
+                repository.require_commit_regular_file(&base.sha, template, &mut runner)?;
+            }
+        }
     }
 
     let app_root = (!source_only)
@@ -666,6 +687,11 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
     if delete_data {
         println!("DDEV data deletion requires a second exact confirmation.");
     }
+    if delete_data && target.ddev.is_none() {
+        return Err(ToolError::new(
+            "--delete-ddev-data was requested but the exact owned DDEV identity is absent",
+        ));
+    }
     if dry_run {
         println!("DRY RUN — no DDEV, Git, file, or ownership mutation performed");
         println!("READY — removal preflight complete");
@@ -674,11 +700,6 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
 
     require_confirmation(name, confirmation, "removal")?;
     if delete_data {
-        if target.ddev.is_none() {
-            return Err(ToolError::new(
-                "--delete-ddev-data was requested but the exact owned DDEV identity is absent",
-            ));
-        }
         require_confirmation(name, data_confirmation, "DDEV data deletion")?;
     }
 

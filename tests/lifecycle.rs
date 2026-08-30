@@ -33,13 +33,96 @@ fn dry_run_is_read_only_for_a_valid_local_base() {
 }
 
 #[test]
-fn create_interruption_after_reservation_preserves_record_worktree_and_branch() {
+fn dry_run_rejects_a_template_missing_from_the_selected_base_before_reservation() {
     let repository = init_repo();
     support::write_tracked_file(
         repository.path(),
         ".ddev-workspaces.toml",
         "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[[files]]\nlabel = 'missing template'\ndestination = '.env'\ntemplate = 'missing.env.example'\n",
     );
+    commit(repository.path(), "add missing template fixture");
+
+    let output = run_cli(
+        repository.path(),
+        &["create", "--dry-run", "--base", "HEAD", "missing-template"],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("regular tracked Git file in base commit"),
+        "{text}"
+    );
+    assert!(
+        !repository
+            .path()
+            .join(".worktrees/missing-template")
+            .exists()
+    );
+    assert!(
+        !repository
+            .path()
+            .join(".git/ddev-workspaces/workspaces/missing-template.toml")
+            .exists()
+    );
+    assert!(
+        !support::run_git(
+            repository.path(),
+            [
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/missing-template"
+            ]
+            .as_slice(),
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn dry_run_accepts_a_regular_tracked_template_in_the_selected_base() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[[files]]\nlabel = 'environment'\ndestination = '.env'\ntemplate = '.env.example'\n",
+    );
+    support::write_tracked_file(repository.path(), ".env.example", "APP_KEY=fixture\n");
+    commit(repository.path(), "add tracked template fixture");
+
+    let output = run_cli(
+        repository.path(),
+        &["create", "--dry-run", "--base", "HEAD", "tracked-template"],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("READY — dry run complete"), "{text}");
+    assert!(
+        !repository
+            .path()
+            .join(".worktrees/tracked-template")
+            .exists()
+    );
+    assert!(
+        !repository
+            .path()
+            .join(".git/ddev-workspaces/workspaces/tracked-template.toml")
+            .exists()
+    );
+}
+
+#[test]
+fn create_failure_after_reservation_preserves_record_worktree_and_branch() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[[files]]\nlabel = 'non-ignored runtime file'\ndestination = 'runtime.env'\ntemplate = 'runtime.env.example'\n",
+    );
+    support::write_tracked_file(repository.path(), "runtime.env.example", "READY=true\n");
     commit(repository.path(), "add failing preparation fixture");
 
     let output = run_cli(
@@ -54,7 +137,7 @@ fn create_interruption_after_reservation_preserves_record_worktree_and_branch() 
 
     assert_eq!(output.status.code(), Some(1));
     assert!(text.contains("NOT READY"));
-    assert!(text.contains("missing.env.example"));
+    assert!(text.contains("is not ignored by Git"));
     assert!(workspace.exists());
     assert!(record.exists());
     assert!(
@@ -113,6 +196,55 @@ fn source_only_remove_requires_confirmation_and_retains_branch() {
         )
         .status
         .success()
+    );
+}
+
+#[test]
+fn source_only_removal_dry_run_rejects_data_deletion_without_owned_ddev() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n",
+    );
+    commit(repository.path(), "add data deletion preflight fixture");
+    let created = run_cli(
+        repository.path(),
+        &[
+            "create",
+            "--source-only",
+            "--base",
+            "HEAD",
+            "source-only-data",
+        ],
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let output = run_cli(
+        repository.path(),
+        &[
+            "remove",
+            "--dry-run",
+            "--delete-ddev-data",
+            "source-only-data",
+        ],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("exact owned DDEV identity is absent"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("READY — removal preflight complete"),
+        "{text}"
+    );
+    assert!(
+        repository
+            .path()
+            .join(".worktrees/source-only-data")
+            .exists()
     );
 }
 
@@ -224,6 +356,57 @@ fn doctor_on_a_linked_worktree_uses_the_manager_configuration() {
     assert!(doctor.status.success(), "{text}");
     assert!(text.contains("Configuration: READY"));
     assert!(text.ends_with("READY\n"));
+}
+
+#[test]
+fn doctor_skips_runtime_and_ddev_for_a_verified_source_only_workspace() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[[files]]\nlabel = 'environment'\ndestination = '.env'\ntemplate = '.env.example'\n\n[[checks]]\nlabel = 'environment key'\nkind = 'env-key'\npath = '.env'\nkey = 'APP_KEY'\n",
+    );
+    support::write_tracked_file(repository.path(), ".env.example", "APP_KEY=fixture\n");
+    support::write_tracked_file(repository.path(), ".ddev/config.yaml", "name: fixture\n");
+    commit(repository.path(), "add source-only doctor fixture");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
+    let fake_log = fake_state.path().join("calls.log");
+    let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
+    let variables = [
+        ("DDEV_FAKE_NAME", "dw-fixture--doctor-source-only"),
+        ("DDEV_FAKE_LOG", fake_log.to_str().expect("fake log path")),
+    ];
+    let created = support::run_cli_with_path_and_vars(
+        repository.path(),
+        &[
+            "create",
+            "--source-only",
+            "--base",
+            "HEAD",
+            "doctor-source-only",
+        ],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let workspace = repository.path().join(".worktrees/doctor-source-only");
+    let workspace_value = workspace.to_str().expect("workspace path");
+    let doctor = support::run_cli_with_path_and_vars(
+        repository.path(),
+        &["doctor", workspace_value],
+        fake_bin.path(),
+        &variables,
+    );
+    let text = format!("{}{}", stdout(&doctor), support::stderr(&doctor));
+
+    assert!(doctor.status.success(), "{text}");
+    assert!(text.contains("Runtime: skipped by --source-only"), "{text}");
+    assert!(text.contains("DDEV: skipped by --source-only"), "{text}");
+    assert!(!workspace.join(".env").exists());
+    assert!(!fake_log.exists());
+    assert!(text.ends_with("READY\n"), "{text}");
 }
 
 #[test]
