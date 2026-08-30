@@ -216,6 +216,8 @@ fn shell_quote_for_display(argument: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn sensitive_requests_redact_arguments_in_display() {
@@ -244,5 +246,93 @@ mod tests {
         let output = runner.run(&request).expect("dry-run should succeed");
 
         assert!(output.success());
+    }
+
+    #[test]
+    fn request_builders_preserve_the_process_contract() {
+        let directory = tempdir().expect("temporary directory");
+        let request = CommandRequest::new("printf", ["two words", "it's-safe"])
+            .cwd(directory.path())
+            .env("FIXTURE_VALUE", "configured")
+            .mutating();
+
+        assert_eq!(request.cwd.as_deref(), Some(directory.path()));
+        assert_eq!(
+            request.env,
+            [("FIXTURE_VALUE".to_owned(), "configured".to_owned())]
+        );
+        assert!(request.mutating);
+        assert_eq!(request.display(), "printf 'two words' 'it'\\''s-safe'");
+        assert_eq!(
+            CommandRequest::new("pwd", std::iter::empty::<String>()).display(),
+            "pwd"
+        );
+    }
+
+    #[test]
+    fn real_runner_honors_working_directory_and_environment() {
+        let directory = tempdir().expect("temporary directory");
+        let mut runner = RealCommandRunner::new(false);
+
+        let pwd = runner
+            .run(&CommandRequest::new("pwd", std::iter::empty::<String>()).cwd(directory.path()))
+            .expect("pwd should run");
+        let environment = runner
+            .run(
+                &CommandRequest::new("printenv", ["DDEV_WORKSPACES_TEST_VALUE"])
+                    .env("DDEV_WORKSPACES_TEST_VALUE", "configured"),
+            )
+            .expect("printenv should run");
+
+        assert!(pwd.success());
+        assert_eq!(
+            fs::canonicalize(pwd.stdout.trim()).expect("reported working directory"),
+            fs::canonicalize(directory.path()).expect("fixture working directory")
+        );
+        assert_eq!(environment.stdout.trim(), "configured");
+    }
+
+    #[test]
+    fn process_start_errors_report_the_request_without_leaking_sensitive_arguments() {
+        let directory = tempdir().expect("temporary directory");
+        let mut runner = RealCommandRunner::new(false);
+        let error = runner
+            .run(
+                &CommandRequest::new("definitely-not-a-command", ["secret"])
+                    .cwd(directory.path())
+                    .sensitive(),
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("definitely-not-a-command [sensitive command]")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&directory.path().display().to_string())
+        );
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn errors_and_outputs_expose_stable_cli_status() {
+        let usage = ToolError::usage("bad arguments");
+        let failure = ToolError::new("failed");
+        let io_error: ToolError = std::io::Error::other("disk unavailable").into();
+        let output = CommandOutput {
+            status: 7,
+            stdout: String::new(),
+            stderr: "failure".to_owned(),
+        };
+
+        assert_eq!(usage.exit_code(), 2);
+        assert_eq!(usage.to_string(), "bad arguments");
+        assert_eq!(failure.exit_code(), 1);
+        assert!(io_error.to_string().contains("I/O error: disk unavailable"));
+        assert!(!output.success());
+        assert!(CommandOutput::dry_run().success());
     }
 }
