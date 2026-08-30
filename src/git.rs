@@ -332,6 +332,38 @@ impl GitRepository {
         )))
     }
 
+    pub fn require_commit_regular_file<R: CommandRunner>(
+        &self,
+        commit: &str,
+        path: &str,
+        runner: &mut R,
+    ) -> ToolResult<()> {
+        let output = run_git(
+            runner,
+            &self.root,
+            ["ls-tree", "-z", "--full-tree", commit, "--", path],
+        )?;
+        let mut entries = output.split_terminator('\0');
+        let regular_file = entries.next().is_some_and(|entry| {
+            let Some((metadata, entry_path)) = entry.split_once('\t') else {
+                return false;
+            };
+            let mut fields = metadata.split_whitespace();
+            matches!(fields.next(), Some("100644" | "100755"))
+                && fields.next() == Some("blob")
+                && fields.next().is_some()
+                && fields.next().is_none()
+                && entry_path == path
+                && entries.next().is_none()
+        });
+        if regular_file {
+            return Ok(());
+        }
+        Err(ToolError::new(format!(
+            "declared template {path} must be a regular tracked Git file in base commit {commit}"
+        )))
+    }
+
     pub fn remove_worktree<R: CommandRunner>(&self, path: &Path, runner: &mut R) -> ToolResult<()> {
         let request = git_request(
             &self.root,
