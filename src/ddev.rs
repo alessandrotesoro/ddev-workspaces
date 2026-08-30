@@ -397,6 +397,7 @@ mod tests {
     use super::*;
     use crate::command::{CommandOutput, CommandRunner};
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[derive(Default)]
     struct FakeRunner {
@@ -471,18 +472,32 @@ mod tests {
 
     #[test]
     fn malformed_json_fails_closed_without_using_partial_state() {
+        let global_directory = tempdir().expect("fake DDEV global directory");
         let mut runner = FakeRunner {
             requests: Vec::new(),
-            responses: vec![CommandOutput {
-                status: 0,
-                stdout: "{not-json".to_owned(),
-                stderr: String::new(),
-            }],
+            responses: vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: "{not-json".to_owned(),
+                    stderr: String::new(),
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: format!(
+                        "{{\"raw\":{{\"global-ddev-dir\":\"{}\"}}}}",
+                        global_directory.path().display()
+                    ),
+                    stderr: String::new(),
+                },
+            ],
         };
 
         let error = list(&mut runner, Path::new("/tmp")).unwrap_err();
 
-        assert!(error.to_string().contains("unsupported JSON"));
+        assert!(error.to_string().contains("unsupported JSON list envelope"));
+        assert_eq!(runner.requests.len(), 2);
+        assert_eq!(runner.requests[0].args, ["version", "--json-output"]);
+        assert_eq!(runner.requests[1].args, ["list", "--json-output"]);
     }
 
     #[test]
@@ -507,5 +522,221 @@ mod tests {
             ]
         );
         assert!(!runner.requests[0].args.iter().any(|arg| arg == "delete"));
+    }
+
+    #[test]
+    fn list_is_read_only_and_reports_registry_warnings() {
+        let directory = tempdir().expect("temporary directory");
+        let global = directory.path().join("global");
+        let existing_app = directory.path().join("app");
+        let missing_app = directory.path().join("missing");
+        fs::create_dir_all(global.join("bin")).expect("global directory");
+        fs::create_dir(&existing_app).expect("existing app root");
+        fs::write(
+            global.join("global_config.yaml"),
+            "instrumentation_opt_in: false\n",
+        )
+        .expect("global config");
+        fs::write(global.join("project_list.yaml"), "project_info: {}\n").expect("project list");
+        let list_json = format!(
+            "{{\"raw\":[{{\"name\":\"one\",\"approot\":\"{}\",\"status\":\"running\"}},{{\"name\":\"one\",\"approot\":\"{}\",\"status\":\"stopped\"}},{{\"name\":\"three\",\"approot\":\"{}\",\"status\":\"running\"}}]}}",
+            existing_app.display(),
+            missing_app.display(),
+            existing_app.display()
+        );
+        let mut runner = FakeRunner {
+            requests: Vec::new(),
+            responses: vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: list_json,
+                    stderr: format!(
+                        "{{\"msg\":\"The project '{}' no longer exists in the filesystem, removing it from registry\"}}\nplain warning\n",
+                        missing_app.display()
+                    ),
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: format!(
+                        "{{\"raw\":{{\"global-ddev-dir\":\"{}\"}}}}",
+                        global.display()
+                    ),
+                    stderr: String::new(),
+                },
+            ],
+        };
+
+        let inspection = list(&mut runner, directory.path()).expect("DDEV inspection");
+
+        assert_eq!(inspection.entries.len(), 3);
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning == "plain warning")
+        );
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("duplicate DDEV name `one`"))
+        );
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("duplicate DDEV app root"))
+        );
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stale DDEV registration"))
+        );
+        let shadow = runner.requests[1]
+            .env
+            .iter()
+            .find(|(name, _)| name == "DDEV_XDG_CONFIG_HOME")
+            .expect("isolated DDEV configuration");
+        assert!(!Path::new(&shadow.1).exists());
+        assert!(!runner.requests.iter().any(|request| request.mutating));
+    }
+
+    #[test]
+    fn list_rejects_failed_or_unsafe_version_and_list_inspection() {
+        let directory = tempdir().expect("temporary directory");
+        let cases = [
+            CommandOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            CommandOutput {
+                status: 0,
+                stdout: "{not-json".to_owned(),
+                stderr: String::new(),
+            },
+            CommandOutput {
+                status: 0,
+                stdout: "{\"raw\":{\"global-ddev-dir\":\"relative\"}}".to_owned(),
+                stderr: String::new(),
+            },
+        ];
+        for response in cases {
+            let mut runner = FakeRunner {
+                requests: Vec::new(),
+                responses: vec![response],
+            };
+            assert!(list(&mut runner, directory.path()).is_err());
+            assert_eq!(runner.requests.len(), 1);
+        }
+
+        let mut runner = FakeRunner {
+            requests: Vec::new(),
+            responses: vec![
+                CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: format!(
+                        "{{\"raw\":{{\"global-ddev-dir\":\"{}\"}}}}",
+                        directory.path().display()
+                    ),
+                    stderr: String::new(),
+                },
+            ],
+        };
+        assert!(list(&mut runner, directory.path()).is_err());
+        assert_eq!(runner.requests.len(), 2);
+    }
+
+    #[test]
+    fn readiness_requires_one_exact_running_healthy_identity() {
+        let root = PathBuf::from("/tmp/workspace");
+        let project = |name: &str, approot: &str, status: &str, mutagen_status: &str| DdevProject {
+            name: name.to_owned(),
+            approot: approot.to_owned(),
+            status: status.to_owned(),
+            mutagen_enabled: !mutagen_status.is_empty(),
+            mutagen_status: mutagen_status.to_owned(),
+        };
+
+        let cases = [
+            vec![],
+            vec![project("other", "/tmp/workspace", "running", "")],
+            vec![project("dw-fixture--task", "/tmp/workspace", "stopped", "")],
+            vec![project(
+                "dw-fixture--task",
+                "/tmp/workspace",
+                "running",
+                "failed",
+            )],
+            vec![
+                project("dw-fixture--task", "/tmp/workspace", "running", ""),
+                project("dw-fixture--task", "/tmp/other", "running", ""),
+            ],
+        ];
+        for entries in cases {
+            let inspection = DdevInspection {
+                entries,
+                warnings: Vec::new(),
+            };
+            assert!(require_ready_identity(&inspection, "dw-fixture--task", &root).is_err());
+        }
+    }
+
+    #[test]
+    fn override_creation_requires_named_regular_ignored_ddev_configuration() {
+        let repository = tempdir().expect("repository");
+        let app = repository.path().join("app");
+        fs::create_dir(&app).expect("app root");
+        let mut runner = FakeRunner::default();
+        assert!(write_override(repository.path(), &app, "dw-fixture--task", &mut runner).is_err());
+
+        fs::create_dir(app.join(".ddev")).expect("DDEV directory");
+        assert!(write_override(repository.path(), &app, "dw-fixture--task", &mut runner).is_err());
+
+        fs::write(app.join(".ddev/config.yaml"), "type: php\n").expect("DDEV config");
+        runner.responses.push(CommandOutput {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        let override_path =
+            write_override(repository.path(), &app, "dw-fixture--task", &mut runner)
+                .expect("ignored override should be created");
+        assert_eq!(
+            fs::read_to_string(&override_path).expect("override contents"),
+            "name: dw-fixture--task\n"
+        );
+        assert!(write_override(repository.path(), &app, "dw-fixture--task", &mut runner).is_err());
+    }
+
+    #[test]
+    fn start_and_stop_fail_closed_on_nonzero_process_status() {
+        let failure = || CommandOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "failed".to_owned(),
+        };
+        let mut runner = FakeRunner {
+            requests: Vec::new(),
+            responses: vec![failure(), failure()],
+        };
+
+        assert!(start(Path::new("/tmp/workspace"), &mut runner).is_err());
+        assert!(
+            stop_unlist(
+                Path::new("/tmp/workspace"),
+                "dw-fixture--task",
+                false,
+                &mut runner
+            )
+            .is_err()
+        );
+        assert!(runner.requests.iter().all(|request| request.mutating));
     }
 }
