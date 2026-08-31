@@ -129,7 +129,7 @@ fn all_animals_greeting(animals: Vec<Box<dyn Animal>>) {
 ## 6.6 🚨 Trait Objects Ergonomics
 
 * Prefer `&dyn Trait` over `Box<dyn Trait>` when you don't need ownership.
-* Use `Arc<dyn Trait>` for shared access across threads.
+* Use `Arc<dyn Trait + Send + Sync>` for shared access across threads.
 * Don't use `dyn Trait` if the trait has methods that return `Self`.
 * **Avoid boxing too early**. Don't box inside structs unless you are sure it'll be beneficial or is required (recursive).
 ```rust

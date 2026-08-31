@@ -126,6 +126,91 @@ fn full_creation_and_default_removal_use_the_exact_fake_identity() {
 }
 
 #[test]
+fn doctor_keeps_full_workspace_runtime_and_ddev_checks() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n",
+    );
+    support::write_tracked_file(repository.path(), ".ddev/config.yaml", "name: fixture\n");
+    commit(repository.path(), "add full doctor fixture");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
+    let state = fake_state.path().join("running");
+    let fake_bin = support::fake_ddev_directory(&state);
+    let variables = [("DDEV_FAKE_NAME", "dw-fixture--doctor-full")];
+    let created = run_cli_with_path_and_vars(
+        repository.path(),
+        &["create", "--base", "HEAD", "doctor-full"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let workspace = repository.path().join(".worktrees/doctor-full");
+    let workspace_value = workspace.to_str().expect("workspace path");
+    let doctor = run_cli_with_path_and_vars(
+        repository.path(),
+        &["doctor", workspace_value],
+        fake_bin.path(),
+        &variables,
+    );
+    let text = format!("{}{}", stdout(&doctor), support::stderr(&doctor));
+
+    assert!(doctor.status.success(), "{text}");
+    assert!(text.contains("Runtime: READY"), "{text}");
+    assert!(text.contains("DDEV: dw-fixture--doctor-full"), "{text}");
+    assert!(!text.contains("skipped by --source-only"), "{text}");
+}
+
+#[test]
+fn data_deletion_dry_run_accepts_an_exact_owned_ddev_without_confirmation() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n",
+    );
+    support::write_tracked_file(repository.path(), ".ddev/config.yaml", "name: fixture\n");
+    commit(repository.path(), "add data deletion dry-run fixture");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
+    let state = fake_state.path().join("running");
+    let fake_log = fake_state.path().join("calls.log");
+    let fake_bin = support::fake_ddev_directory(&state);
+    let variables = [
+        ("DDEV_FAKE_NAME", "dw-fixture--data-dry-run"),
+        ("DDEV_FAKE_LOG", fake_log.to_str().expect("fake log path")),
+    ];
+    let created = run_cli_with_path_and_vars(
+        repository.path(),
+        &["create", "--base", "HEAD", "data-dry-run"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let output = run_cli_with_path_and_vars(
+        repository.path(),
+        &["remove", "--dry-run", "--delete-ddev-data", "data-dry-run"],
+        fake_bin.path(),
+        &variables,
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("READY — removal preflight complete"),
+        "{text}"
+    );
+    assert!(state.exists());
+    assert!(repository.path().join(".worktrees/data-dry-run").exists());
+    let calls = fs::read_to_string(fake_log).expect("fake DDEV call log");
+    assert!(!calls.lines().any(|line| line.starts_with("stop ")));
+}
+
+#[test]
 fn ddev_data_removal_requires_two_exact_confirmations() {
     let repository = init_repo();
     support::write_tracked_file(

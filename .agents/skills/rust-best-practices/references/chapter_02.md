@@ -22,7 +22,7 @@ $ cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 * `--all-targets`: checks library, tests, benches and examples.
-* `--all-features`: checks code for all features enabled, auto solves conflicting features.
+* `--all-features`: enables all declared features; it does not automatically resolve mutually incompatible feature combinations.
 * `--locked`: Requires `Cargo.lock` to be up-to-date, can be solved with `$ cargo update`.
 * `-D warnings`: treats warnings as errors
 
