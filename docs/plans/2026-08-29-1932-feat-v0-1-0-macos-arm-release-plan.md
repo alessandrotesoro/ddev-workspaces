@@ -10,6 +10,14 @@ execution: code
 
 # Release ddev-workspaces v0.1.0 for macOS ARM
 
+> Historical record: this plan describes the original manual v0.1.0 release
+> proposal and is retained for its execution evidence. It is superseded by
+> the dist-generated [`release.yml`](../../.github/workflows/release.yml) and
+> [`dist-workspace.toml`](../../dist-workspace.toml), which are now the sole
+> supported release procedure. All requirements and commands below are a
+> historical snapshot, not current instructions. Do not run the manual `gh
+> release` sequence in this document; it is not a competing release path.
+
 ## Goal Capsule
 
 - **Objective:** A user on the verified Apple Silicon macOS environment with repository access can download the accepted `ddev-workspaces` v0.1.0 CLI, verify its integrity, install it, and complete one safe disposable source-only lifecycle.
@@ -94,7 +102,7 @@ The CLI is accepted and `Cargo.toml` already declares 0.1.0, but the repository 
 - KTD4. **Draft, inspect, publish, then download.** `gh release create --draft` uploads both assets and creates the exact tag target; `gh release view` checks draft metadata; `gh release edit --draft=false` publishes; `gh release download` provides an independent post-publication copy. This agent-proposed sequencing provides the required unpublished-state rollback point without adding automation. Governs R7-R11.
 - KTD5. **One disposable source-only smoke.** The installed downloaded binary uses a temporary local Git repository and no `[ddev]` configuration. This proves the distributed executable's safe lifecycle without repeating either accepted product pilot. (session-settled: user-directed — chosen over rerunning the two full pilots; governs R8-R10.)
 
-### Release Sequence and Command Contract
+### Historical Manual Release Sequence and Command Contract (Superseded)
 
 Run from a fresh local checkout after the plan PR is reviewed and merged. Use task-specific variables such as `release_sha`, `release_stage`, and `release_download`; do not place secrets in scripts or notes.
 

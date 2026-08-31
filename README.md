@@ -16,7 +16,7 @@ and the project configuration is a finite, strict TOML file.
 
 ## Release planning
 
-- [v0.1.0 macOS ARM release plan](docs/plans/2026-08-29-1932-feat-v0-1-0-macos-arm-release-plan.md)
+- [Historical v0.1.0 macOS ARM release plan (superseded)](docs/plans/2026-08-29-1932-feat-v0-1-0-macos-arm-release-plan.md)
 - [Permanent project configuration rollout plan](docs/plans/2026-08-29-2232-feat-permanent-project-config-rollout-plan.md)
 
 ## Build and install locally
@@ -32,6 +32,59 @@ The runtime dependencies are the installed `git` command and, when a project
 declares `[ddev]`, the installed `ddev` command. Automated tests use temporary
 Git repositories and fake commands; they do not need Docker, DDEV, network
 access, or project credentials.
+
+## Distribution
+
+The supported release target is Apple Silicon macOS
+(`aarch64-apple-darwin`). The generated
+[`dist`](https://axodotdev.github.io/cargo-dist/book/)
+workflow is triggered by a version tag and publishes the native archive,
+SHA-256 checksums, shell installer, scoped npm package, Homebrew formula, and
+GitHub artifact attestations.
+This setup has not created a release or published any package, so the commands
+below remain unavailable until the first authorized release is published.
+
+The repository also has a pre-existing private `v0.1.0` release containing
+legacy `.tar.gz` assets; this task did not change it. Use the commands below
+only with a later authorized public dist release tag. Anonymous shell, npm,
+and Homebrew consumers need the GitHub release assets to be publicly readable,
+and GitHub artifact attestations require a public repository or GitHub
+Enterprise.
+
+For a published release, choose one of these installation paths:
+
+```sh
+dist_release_tag="<authorized-dist-version-tag>"
+
+# Manual archive installation
+curl -LO "https://github.com/alessandrotesoro/ddev-workspaces/releases/download/${dist_release_tag}/ddev-workspaces-aarch64-apple-darwin.tar.xz"
+curl -LO "https://github.com/alessandrotesoro/ddev-workspaces/releases/download/${dist_release_tag}/ddev-workspaces-aarch64-apple-darwin.tar.xz.sha256"
+shasum -a 256 --check ddev-workspaces-aarch64-apple-darwin.tar.xz.sha256
+tar -xJf ddev-workspaces-aarch64-apple-darwin.tar.xz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 ddev-workspaces-aarch64-apple-darwin/ddev-workspaces "$HOME/.local/bin/ddev-workspaces"
+
+# Generated cargo-dist shell installer
+curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/alessandrotesoro/ddev-workspaces/releases/download/${dist_release_tag}/ddev-workspaces-installer.sh" | sh
+
+# Generated npm package
+npm install -g @sematico/ddev-workspaces
+npx @sematico/ddev-workspaces
+
+# Generated Homebrew formula
+brew install alessandrotesoro/tap/ddev-workspaces
+```
+
+The npm publication requires the repository secret `NPM_TOKEN`, containing a
+granular token with read/write permission for the `@sematico` scope. The
+Homebrew publication requires `HOMEBREW_TAP_TOKEN`, containing a GitHub PAT
+that can write `alessandrotesoro/homebrew-tap`. Token values are never stored
+in this repository.
+
+The standalone dist self-updater is intentionally disabled because it is
+experimental and would add a separate `ddev-workspaces-update` program.
+PowerShell, MSI, other platform targets, Apple signing, and notarization are
+also outside the current Apple Silicon macOS release scope.
 
 ## Configure a repository
 
