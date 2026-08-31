@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM64
+            runner: macos-15
+            host: aarch64-apple-darwin
+            architecture: arm64
+          - name: Linux x64
+            runner: ubuntu-24.04
+            host: x86_64-unknown-linux-gnu
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - name: Verify native runner
+        shell: bash
+        run: |
+          test "$(uname -m)" = "${{ matrix.architecture }}"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.host }}"
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check all targets
+        run: cargo check --all-targets --all-features --locked
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings -D clippy::perf
+      - name: Run behavioral tests
+        run: cargo test --all-targets --all-features --locked
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features --locked --document-private-items
+      - name: Build the release binary
+        run: cargo build --release --locked
+
+  ddev-lifecycle:
+    name: Disposable DDEV lifecycle (Linux x64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build the release binary
+        run: cargo build --release --locked
+      - name: Create the disposable project
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/ddev-workspaces-ci"
+          git init --initial-branch=main "$fixture"
+          git -C "$fixture" config user.name "DDEV Workspaces CI"
+          git -C "$fixture" config user.email "ci@example.invalid"
+          mkdir -p "$fixture/.ddev"
+          printf '%s\n' \
+            'type: php' \
+            'docroot: .' \
+            'disable_settings_management: true' \
+            'performance_mode: none' \
+            'omit_containers: [db]' \
+            > "$fixture/.ddev/config.yaml"
+          printf '%s\n' \
+            'version = 1' \
+            'project_id = "ci"' \
+            'workspace_root = ".worktrees"' \
+            '' \
+            '[ddev]' \
+            'app_root = "."' \
+            > "$fixture/.ddev-workspaces.toml"
+          printf '%s\n' '.worktrees/' '.ddev/config.ddev-workspaces.yaml' > "$fixture/.gitignore"
+          printf '%s\n' '<?php echo "ready";' > "$fixture/index.php"
+          git -C "$fixture" add .
+          git -C "$fixture" commit -m "Create disposable DDEV fixture"
+      - name: Install DDEV for the Linux lifecycle
+        uses: ddev/github-action-setup-ddev@v1
+        with:
+          autostart: false
+          ddevDir: ${{ runner.temp }}/ddev-workspaces-ci
+          version: 1.25.3
+      - name: Run and clean the disposable DDEV lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/ddev-workspaces-ci"
+          workspace="$fixture/.worktrees/ci-lifecycle"
+          binary="$GITHUB_WORKSPACE/target/release/ddev-workspaces"
+
+          cleanup() {
+            ddev stop --unlist dw-ci--ci-lifecycle >/dev/null 2>&1 || true
+            if git -C "$fixture" worktree list --porcelain 2>/dev/null | grep -Fq "worktree $workspace"; then
+              git -C "$fixture" worktree remove --force "$workspace" || true
+            fi
+            git -C "$fixture" branch -D ci-lifecycle >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker info >/dev/null
+          ddev version
+          "$binary" doctor "$fixture"
+          (
+            cd "$fixture"
+            "$binary" create --dry-run --base HEAD ci-lifecycle
+            "$binary" create --base HEAD ci-lifecycle
+            "$binary" list
+          )
+          "$binary" doctor "$workspace"
+          (
+            cd "$fixture"
+            "$binary" remove --dry-run ci-lifecycle
+            "$binary" remove --confirm ci-lifecycle ci-lifecycle
+          )
+          test ! -e "$workspace"
+          test ! -e "$fixture/.git/ddev-workspaces/workspaces/ci-lifecycle.toml"
+          git -C "$fixture" branch -D ci-lifecycle
+          test -z "$(ddev list --json-output | jq -r '.raw[]? | select(.name == "dw-ci--ci-lifecycle") | .name')"
+          trap - EXIT
