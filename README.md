@@ -35,9 +35,11 @@ access, or project credentials.
 
 ## Distribution
 
-The supported release target is Apple Silicon macOS
-(`aarch64-apple-darwin`). The generated
-[`dist`](https://axodotdev.github.io/cargo-dist/book/)
+The supported release targets are Apple Silicon macOS
+(`aarch64-apple-darwin`) and x64 Linux
+(`x86_64-unknown-linux-gnu`). The Linux artifact runs natively on x64 Linux
+and inside an x64 WSL2 distribution; there is no native Windows binary. The
+generated [`dist`](https://axodotdev.github.io/cargo-dist/book/)
 workflow is triggered by a version tag and publishes the native archive,
 SHA-256 checksums, shell installer, scoped npm package, Homebrew formula, and
 GitHub artifact attestations.
@@ -57,12 +59,22 @@ For a published release, choose one of these installation paths:
 dist_release_tag="<authorized-dist-version-tag>"
 
 # Manual archive installation
-curl -LO "https://github.com/alessandrotesoro/ddev-workspaces/releases/download/${dist_release_tag}/ddev-workspaces-aarch64-apple-darwin.tar.xz"
-curl -LO "https://github.com/alessandrotesoro/ddev-workspaces/releases/download/${dist_release_tag}/ddev-workspaces-aarch64-apple-darwin.tar.xz.sha256"
-shasum -a 256 --check ddev-workspaces-aarch64-apple-darwin.tar.xz.sha256
-tar -xJf ddev-workspaces-aarch64-apple-darwin.tar.xz
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) dist_target="aarch64-apple-darwin" ;;
+  Linux-x86_64) dist_target="x86_64-unknown-linux-gnu" ;;
+  *) echo "Unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+dist_archive="ddev-workspaces-${dist_target}.tar.xz"
+curl -LO "https://github.com/alessandrotesoro/ddev-workspaces/releases/download/${dist_release_tag}/${dist_archive}"
+curl -LO "https://github.com/alessandrotesoro/ddev-workspaces/releases/download/${dist_release_tag}/${dist_archive}.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum --check "${dist_archive}.sha256"
+else
+  shasum -a 256 --check "${dist_archive}.sha256"
+fi
+tar -xJf "$dist_archive"
 mkdir -p "$HOME/.local/bin"
-install -m 0755 ddev-workspaces-aarch64-apple-darwin/ddev-workspaces "$HOME/.local/bin/ddev-workspaces"
+install -m 0755 "ddev-workspaces-${dist_target}/ddev-workspaces" "$HOME/.local/bin/ddev-workspaces"
 
 # Generated cargo-dist shell installer
 curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/alessandrotesoro/ddev-workspaces/releases/download/${dist_release_tag}/ddev-workspaces-installer.sh" | sh
@@ -81,10 +93,34 @@ Homebrew publication requires `HOMEBREW_TAP_TOKEN`, containing a GitHub PAT
 that can write `alessandrotesoro/homebrew-tap`. Token values are never stored
 in this repository.
 
+The ordinary `CI` workflow is non-publishing. It runs formatting, checks,
+Clippy, the complete Rust behavioral suite, rustdoc, and a release build on
+native macOS ARM64 and Linux x64 runners. A separate Linux x64 job uses the
+runner's Docker service and DDEV's official setup action for one disposable
+create/list/doctor/remove lifecycle. CI has read-only repository permission,
+uses no release credential, and cannot tag, host, publish, or announce.
+
+The generated `Release` workflow remains cargo-dist's sole release owner and
+normally uses `pr-run-mode = "plan"`. For a bounded distribution change that
+needs native artifact proof, use this procedure on its dedicated pull request:
+
+1. Temporarily change `pr-run-mode` to `"upload"` in `dist-workspace.toml`, run
+   `dist generate`, and commit both the configuration and generated workflow.
+2. Let that pull request build and attach the native cargo-dist artifacts.
+   Pull-request mode must not host a GitHub Release, publish npm or Homebrew,
+   or announce a release.
+3. Inspect both native archives, checksums, and generated installer selection.
+4. Restore `pr-run-mode = "plan"`, run `dist generate` again, and require
+   `dist generate --check` before merge.
+
+GitHub Actions billing is currently unavailable, so this pull request records
+the locally reproducible checks while native hosted CI and distribution-upload
+proof remain pending.
+
 The standalone dist self-updater is intentionally disabled because it is
 experimental and would add a separate `ddev-workspaces-update` program.
-PowerShell, MSI, other platform targets, Apple signing, and notarization are
-also outside the current Apple Silicon macOS release scope.
+Native Windows, PowerShell, MSI, other platform targets, Apple signing, and
+notarization remain outside the current distribution scope.
 
 ## Configure a repository
 

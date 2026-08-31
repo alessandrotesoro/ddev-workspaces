@@ -10,7 +10,10 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "npm", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin"]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Pull requests plan releases by default; dedicated distribution-change PRs may
+# temporarily use "upload" as documented in README.md.
+pr-run-mode = "plan"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
