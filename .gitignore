@@ -11,3 +11,7 @@ target/
 *.tmp
 *.swp
 *~
+/docs/
+/AGENTS.md
+/.agents/
+/skills-lock.json
