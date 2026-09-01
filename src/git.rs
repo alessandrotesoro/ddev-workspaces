@@ -463,12 +463,12 @@ impl GitRepository {
         }
 
         let current_head = self.current_head(runner)?;
-        if let Some(expected_commit) = expected_commit {
-            if current_head != expected_commit {
-                diagnostics.issues.push(format!(
-                    "worktree HEAD {current_head} differs from expected base {expected_commit}"
-                ));
-            }
+        if let Some(expected_commit) = expected_commit
+            && current_head != expected_commit
+        {
+            diagnostics.issues.push(format!(
+                "worktree HEAD {current_head} differs from expected base {expected_commit}"
+            ));
         }
         let comparison = expected_commit.unwrap_or("HEAD");
         let index_diff = run_git_allow_failure(
@@ -790,13 +790,14 @@ fn parse_remote_head(output: &str) -> (Vec<String>, Vec<(String, String)>) {
             }
         } else {
             let mut fields = line.split_whitespace();
-            if let (Some(sha), Some(name)) = (fields.next(), fields.next()) {
-                if name == "HEAD" && is_full_commit_id(sha) {
-                    heads.push((
-                        references.last().cloned().unwrap_or_default(),
-                        sha.to_owned(),
-                    ));
-                }
+            if let (Some(sha), Some(name)) = (fields.next(), fields.next())
+                && name == "HEAD"
+                && is_full_commit_id(sha)
+            {
+                heads.push((
+                    references.last().cloned().unwrap_or_default(),
+                    sha.to_owned(),
+                ));
             }
         }
     }
