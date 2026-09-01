@@ -204,7 +204,8 @@ Run `ddev-workspaces <command> --help` for complete option details.
 
 ## Troubleshooting
 
-### The remote default commit is missing locally
+<details>
+<summary><strong>The remote default commit is missing locally</strong></summary>
 
 Fetch the default branch named in the error, then retry:
 
@@ -212,21 +213,32 @@ Fetch the default branch named in the error, then retry:
 git fetch origin main
 ```
 
-### The workspace root or prepared file is not ignored
+</details>
+
+<details>
+<summary><strong>The workspace root or prepared file is not ignored</strong></summary>
 
 Add the reported path to `.gitignore` or `.git/info/exclude`. The tool never edits ignore rules for you.
 
-### Creation failed after ownership was reserved
+</details>
+
+<details>
+<summary><strong>Creation failed after ownership was reserved</strong></summary>
 
 Do not delete the worktree or ownership record blindly. Run `ddev-workspaces doctor PATH` using the path printed in the failure report, fix the named source, command, check, or DDEV issue, and inspect it again.
 
-### Removal requires confirmation
+</details>
+
+<details>
+<summary><strong>Removal requires confirmation</strong></summary>
 
 Pass the workspace name twice so the option and positional argument match exactly:
 
 ```sh
 ddev-workspaces remove --confirm feature-name feature-name
 ```
+
+</details>
 
 ## Development
 
