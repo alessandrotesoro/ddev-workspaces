@@ -2,7 +2,7 @@
 name = "ddev-workspaces"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.97.1"
 description = "A conservative local Git worktree and DDEV workspace manager"
 license = "MIT"
 repository = "https://github.com/alessandrotesoro/ddev-workspaces"
