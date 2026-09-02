@@ -21,12 +21,12 @@ pub struct OwnershipRecord {
     pub source_only: bool,
     pub ddev_app_root: Option<String>,
     #[serde(default)]
-    pub external_ddev_site: bool,
+    pub source_site: bool,
 }
 
 impl OwnershipRecord {
-    pub fn owns_external_ddev_site(&self) -> bool {
-        self.external_ddev_site
+    pub fn uses_source_site(&self) -> bool {
+        self.source_site
             || self
                 .ddev_app_root
                 .as_deref()
@@ -248,7 +248,7 @@ mod tests {
             ddev_name: "dw-fixture--task-1".to_owned(),
             source_only: false,
             ddev_app_root: Some(".".to_owned()),
-            external_ddev_site: false,
+            source_site: false,
         }
     }
 

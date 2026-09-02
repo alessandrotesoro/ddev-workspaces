@@ -350,16 +350,16 @@ pub fn write_override<R: CommandRunner>(
     Ok(override_path)
 }
 
-pub fn prepare_external_site(
+pub fn prepare_source_site(
     workspace: &Path,
     app_root: &Path,
     generated_root: &Path,
     source_root: &Path,
     repository_path: &str,
 ) -> ToolResult<()> {
-    reserve_external_app_root(generated_root, app_root)?;
+    reserve_generated_app_root(generated_root, app_root)?;
     let excluded_repository = source_root.join(repository_path);
-    copy_external_site_tree(source_root, app_root, &excluded_repository, source_root)?;
+    copy_source_site_tree(source_root, app_root, &excluded_repository, source_root)?;
     let mounted_repository = app_root.join(repository_path);
     fs::create_dir_all(&mounted_repository)?;
     let ddev_directory = app_root.join(".ddev");
@@ -386,11 +386,11 @@ pub fn prepare_external_site(
     Ok(())
 }
 
-fn reserve_external_app_root(generated_root: &Path, app_root: &Path) -> ToolResult<()> {
+fn reserve_generated_app_root(generated_root: &Path, app_root: &Path) -> ToolResult<()> {
     let generated_root = fs::canonicalize(generated_root)?;
     let relative = app_root.strip_prefix(&generated_root).map_err(|_| {
         ToolError::new(format!(
-            "external DDEV app root {} is outside generated root {}",
+            "generated DDEV app root {} is outside generated root {}",
             app_root.display(),
             generated_root.display()
         ))
@@ -400,7 +400,7 @@ fn reserve_external_app_root(generated_root: &Path, app_root: &Path) -> ToolResu
     while let Some(component) = components.next() {
         let std::path::Component::Normal(part) = component else {
             return Err(ToolError::new(
-                "external DDEV app root contains an unsafe component",
+                "generated DDEV app root contains an unsafe component",
             ));
         };
         current.push(part);
@@ -418,7 +418,7 @@ fn reserve_external_app_root(generated_root: &Path, app_root: &Path) -> ToolResu
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(ToolError::new(format!(
-                    "external DDEV app root {} already exists; refusing to overwrite it",
+                    "generated DDEV app root {} already exists; refusing to overwrite it",
                     app_root.display()
                 )));
             }
@@ -428,7 +428,7 @@ fn reserve_external_app_root(generated_root: &Path, app_root: &Path) -> ToolResu
     Ok(())
 }
 
-fn copy_external_site_tree(
+fn copy_source_site_tree(
     source: &Path,
     destination: &Path,
     excluded_repository: &Path,
@@ -442,11 +442,11 @@ fn copy_external_site_tree(
         let target = fs::read_link(source)?;
         let resolved_target = source
             .parent()
-            .ok_or_else(|| ToolError::new("external DDEV symlink has no parent"))?
+            .ok_or_else(|| ToolError::new("source DDEV site symlink has no parent"))?
             .join(&target);
         let canonical_target = fs::canonicalize(&resolved_target).map_err(|error| {
             ToolError::new(format!(
-                "external DDEV site symlink {} has an unavailable target: {error}",
+                "source DDEV site symlink {} has an unavailable target: {error}",
                 source.display()
             ))
         })?;
@@ -455,7 +455,7 @@ fn copy_external_site_tree(
             || canonical_target.starts_with(excluded_repository)
         {
             return Err(ToolError::new(format!(
-                "external DDEV site contains symlink {}; refusing to copy a link that could escape the generated site",
+                "source DDEV site contains symlink {}; refusing to copy a link that could escape the generated site",
                 source.display()
             )));
         }
@@ -463,7 +463,7 @@ fn copy_external_site_tree(
         std::os::unix::fs::symlink(target, destination)?;
         #[cfg(not(unix))]
         return Err(ToolError::new(format!(
-            "external DDEV site contains symlink {}, which is unsupported on this platform",
+            "source DDEV site contains symlink {}, which is unsupported on this platform",
             source.display()
         )));
         return Ok(());
@@ -481,7 +481,7 @@ fn copy_external_site_tree(
     }
     if !metadata.is_dir() {
         return Err(ToolError::new(format!(
-            "external DDEV site contains unsupported entry {}",
+            "source DDEV site contains unsupported entry {}",
             source.display()
         )));
     }
@@ -522,7 +522,7 @@ fn copy_external_site_tree(
         }) {
             continue;
         }
-        copy_external_site_tree(
+        copy_source_site_tree(
             &child_source,
             &destination.join(entry.file_name()),
             excluded_repository,
@@ -712,7 +712,7 @@ pub fn clone_database<R: CommandRunner>(
         .mutating();
         if !runner.run(&export)?.success() {
             return Err(ToolError::new(format!(
-                "could not export the external DDEV database from {}",
+                "could not export the source DDEV database from {}",
                 source_root.display()
             )));
         }
@@ -731,7 +731,7 @@ pub fn clone_database<R: CommandRunner>(
             let detail = format!("{}{}", output.stdout, output.stderr);
             let detail = detail.trim();
             return Err(ToolError::new(format!(
-                "could not import the external DDEV database into {}{}",
+                "could not import the source DDEV database into {}{}",
                 target_root.display(),
                 if detail.is_empty() {
                     String::new()
@@ -752,7 +752,7 @@ pub fn clone_database<R: CommandRunner>(
             Ok(())
         } else {
             Err(ToolError::new(format!(
-                "external DDEV database was cloned, but {} could not be restored to its stopped state",
+                "source DDEV database was cloned, but {} could not be restored to its stopped state",
                 source_root.display()
             )))
         }
@@ -1190,22 +1190,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn external_site_copy_rejects_symlinks_before_owned_files_are_written() {
+    fn source_site_copy_rejects_symlinks_before_owned_files_are_written() {
         use std::os::unix::fs::symlink;
 
         let fixture = tempdir().expect("fixture");
         let source = fixture.path().join("source");
         let generated = fixture.path().join("generated");
-        let external_ddev = fixture.path().join("source-ddev");
+        let source_ddev = fixture.path().join("source-ddev");
         fs::create_dir_all(&source).expect("source");
         fs::create_dir(&generated).expect("generated root");
         let generated = fs::canonicalize(generated).expect("canonical generated root");
         let app_root = generated.join("fixture/task");
-        fs::create_dir(&external_ddev).expect("external DDEV directory");
-        fs::write(external_ddev.join("config.yaml"), "type: wordpress\n").expect("DDEV config");
-        symlink(&external_ddev, source.join(".ddev")).expect("source DDEV symlink");
+        fs::create_dir(&source_ddev).expect("source DDEV directory");
+        fs::write(source_ddev.join("config.yaml"), "type: wordpress\n").expect("DDEV config");
+        symlink(&source_ddev, source.join(".ddev")).expect("source DDEV symlink");
 
-        let error = prepare_external_site(
+        let error = prepare_source_site(
             fixture.path(),
             &app_root,
             &generated,
@@ -1216,14 +1216,14 @@ mod tests {
 
         assert!(error.to_string().contains("contains symlink"), "{error}");
         assert!(
-            !external_ddev
+            !source_ddev
                 .join("docker-compose.ddev-workspaces.yaml")
                 .exists()
         );
     }
 
     #[test]
-    fn external_site_reserves_the_app_root_exclusively() {
+    fn source_site_reserves_the_app_root_exclusively() {
         let fixture = tempdir().expect("fixture");
         let source = fixture.path().join("source");
         let generated = fixture.path().join("generated");
@@ -1234,7 +1234,7 @@ mod tests {
         let app_root = generated.join("fixture/task");
         fs::create_dir_all(&app_root).expect("occupied app root");
 
-        let error = prepare_external_site(
+        let error = prepare_source_site(
             fixture.path(),
             &app_root,
             &generated,
