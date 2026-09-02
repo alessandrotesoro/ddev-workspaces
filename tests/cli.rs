@@ -36,3 +36,13 @@ fn command_help_exposes_dry_run_and_source_only() {
     assert!(text.contains("--source-only"));
     assert!(text.contains("--base"));
 }
+
+#[test]
+fn remove_help_exposes_one_confirmation_bypass() {
+    let output = run_cli(std::path::Path::new("."), &["remove", "--help"]);
+    let text = stdout(&output);
+
+    assert!(output.status.success());
+    assert!(text.contains("--yes"));
+    assert!(!text.contains("--confirm"));
+}

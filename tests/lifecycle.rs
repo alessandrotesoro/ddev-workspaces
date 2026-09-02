@@ -151,7 +151,7 @@ fn create_failure_after_reservation_preserves_record_worktree_and_branch() {
 }
 
 #[test]
-fn source_only_remove_requires_confirmation_and_retains_branch() {
+fn source_only_remove_requires_yes_noninteractively_and_retains_branch() {
     let repository = init_repo();
     support::write_tracked_file(
         repository.path(),
@@ -168,7 +168,7 @@ fn source_only_remove_requires_confirmation_and_retains_branch() {
     let rejected = run_cli(repository.path(), &["remove", "remove-me"]);
     let rejected_text = format!("{}{}", stdout(&rejected), support::stderr(&rejected));
     assert_eq!(rejected.status.code(), Some(1));
-    assert!(rejected_text.contains("requires `--confirm remove-me`"));
+    assert!(rejected_text.contains("requires `--yes`"));
     assert!(repository.path().join(".worktrees/remove-me").exists());
 
     let dry_run = run_cli(repository.path(), &["remove", "--dry-run", "remove-me"]);
@@ -177,10 +177,7 @@ fn source_only_remove_requires_confirmation_and_retains_branch() {
     assert!(dry_text.contains("DRY RUN"));
     assert!(repository.path().join(".worktrees/remove-me").exists());
 
-    let removed = run_cli(
-        repository.path(),
-        &["remove", "--confirm", "remove-me", "remove-me"],
-    );
+    let removed = run_cli(repository.path(), &["remove", "--yes", "remove-me"]);
     assert!(removed.status.success(), "{}", support::stderr(&removed));
     assert!(!repository.path().join(".worktrees/remove-me").exists());
     assert!(
@@ -473,10 +470,7 @@ fn malformed_ownership_record_is_never_a_removal_authority() {
     assert_eq!(doctor.status.code(), Some(1));
     assert!(doctor_text.contains("Ownership: NOT READY"));
 
-    let output = run_cli(
-        repository.path(),
-        &["remove", "--confirm", "unmanaged", "unmanaged"],
-    );
+    let output = run_cli(repository.path(), &["remove", "--yes", "unmanaged"]);
     let text = format!("{}{}", stdout(&output), support::stderr(&output));
 
     assert_eq!(output.status.code(), Some(1));
@@ -503,10 +497,7 @@ fn dirty_worktree_is_refused_before_removal() {
     )
     .expect("untracked worktree file");
 
-    let output = run_cli(
-        repository.path(),
-        &["remove", "--confirm", "dirty", "dirty"],
-    );
+    let output = run_cli(repository.path(), &["remove", "--yes", "dirty"]);
     let text = format!("{}{}", stdout(&output), support::stderr(&output));
 
     assert_eq!(output.status.code(), Some(1));
@@ -557,7 +548,7 @@ fn main_worktree_alias_is_refused_even_with_a_record() {
     )
     .expect("main ownership record");
 
-    let output = run_cli(repository.path(), &["remove", "--confirm", "main", "main"]);
+    let output = run_cli(repository.path(), &["remove", "--yes", "main"]);
     let text = format!("{}{}", stdout(&output), support::stderr(&output));
 
     assert_eq!(output.status.code(), Some(1));

@@ -193,7 +193,7 @@ fn source_site_creation_mounts_the_site_and_plugin_worktree_and_clones_database(
 
     let removed = run_cli_with_path_and_vars(
         &repository,
-        &["remove", "--confirm", "nested", "nested"],
+        &["remove", "--yes", "nested"],
         fake_bin.path(),
         &variables,
     );
@@ -279,7 +279,7 @@ fn partial_source_site_creation_without_an_app_root_can_be_removed() {
     let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
     let removed = run_cli_with_path_and_vars(
         &repository,
-        &["remove", "--confirm", "partial", "partial"],
+        &["remove", "--yes", "partial"],
         fake_bin.path(),
         &[("HOME", generated.path().to_str().expect("test home"))],
     );
@@ -320,7 +320,7 @@ fn removal_refuses_source_site_mode_drift_without_orphaning_owned_state() {
     .expect("plain DDEV configuration");
     let removed = run_cli_with_path_and_vars(
         &repository,
-        &["remove", "--confirm", "drift", "drift"],
+        &["remove", "--yes", "drift"],
         fake_bin.path(),
         &variables,
     );
@@ -429,7 +429,7 @@ fn full_creation_and_default_removal_use_the_exact_fake_identity() {
 
     let removed = run_cli_with_path_and_vars(
         repository.path(),
-        &["remove", "--confirm", "task-1", "task-1"],
+        &["remove", "--yes", "task-1"],
         fake_bin.path(),
         &variables,
     );
@@ -583,7 +583,7 @@ fn data_deletion_dry_run_accepts_an_exact_owned_ddev_without_confirmation() {
 }
 
 #[test]
-fn ddev_data_removal_requires_two_exact_confirmations() {
+fn ddev_data_removal_requires_yes_noninteractively() {
     let repository = init_repo();
     support::write_tracked_file(
         repository.path(),
@@ -609,38 +609,24 @@ fn ddev_data_removal_requires_two_exact_confirmations() {
     );
     assert!(created.status.success(), "{}", support::stderr(&created));
 
-    let missing_data_confirmation = run_cli_with_path_and_vars(
+    let missing_confirmation = run_cli_with_path_and_vars(
         repository.path(),
-        &[
-            "remove",
-            "--delete-ddev-data",
-            "--confirm",
-            "data-test",
-            "data-test",
-        ],
+        &["remove", "--delete-ddev-data", "data-test"],
         fake_bin.path(),
         &variables,
     );
     let missing_text = format!(
         "{}{}",
-        stdout(&missing_data_confirmation),
-        support::stderr(&missing_data_confirmation)
+        stdout(&missing_confirmation),
+        support::stderr(&missing_confirmation)
     );
-    assert_eq!(missing_data_confirmation.status.code(), Some(1));
-    assert!(missing_text.contains("second exact confirmation"));
+    assert_eq!(missing_confirmation.status.code(), Some(1));
+    assert!(missing_text.contains("requires `--yes`"));
     assert!(state.exists());
 
     let removed = run_cli_with_path_and_vars(
         repository.path(),
-        &[
-            "remove",
-            "--delete-ddev-data",
-            "--confirm",
-            "data-test",
-            "--confirm-data",
-            "data-test",
-            "data-test",
-        ],
+        &["remove", "--delete-ddev-data", "--yes", "data-test"],
         fake_bin.path(),
         &variables,
     );
@@ -733,7 +719,7 @@ fn removal_uses_creation_ddev_provenance_after_configuration_changes() {
 
     let removed = run_cli_with_path_and_vars(
         repository.path(),
-        &["remove", "--confirm", "provenance", "provenance"],
+        &["remove", "--yes", "provenance"],
         fake_bin.path(),
         &variables,
     );
