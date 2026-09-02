@@ -98,7 +98,7 @@ fn doctor(arguments: &ArgMatches) -> ToolResult<u8> {
                     ddev_config
                         .source_site
                         .as_ref()
-                        .map(config::source_site_root)
+                        .map(|_| config::source_site_root(&repository.main_worktree))
                         .transpose()?
                         .unwrap_or(config::safe_join(&repository.root, &ddev_config.app_root)?)
                 };
@@ -1354,10 +1354,12 @@ fn configured_ddev_app_root(
     let Some(ddev_config) = &project_config.ddev else {
         return Ok(None);
     };
-    if let Some(source_site) = &ddev_config.source_site {
-        let generated_root = resolved_source_site
-            .map(|resolved| resolved.generated_root.clone())
-            .unwrap_or(config::source_generated_root(source_site)?);
+    if ddev_config.source_site.is_some() {
+        let generated_root = if let Some(resolved) = resolved_source_site {
+            resolved.generated_root.clone()
+        } else {
+            config::source_generated_root()?
+        };
         let mut relative = PathBuf::from(&project_config.project_id).join(workspace_name);
         let app_relative = config::normalize_relative_path(&ddev_config.app_root);
         if !app_relative.as_os_str().is_empty() {
@@ -1493,9 +1495,10 @@ fn print_create_dry_run(
             .and_then(|ddev| ddev.source_site.as_ref())
         {
             println!(
-                "Planned source DDEV site mount: ${} with repository at {}",
-                source_site.source_root_env, source_site.repository_path
+                "Planned auto-discovered source DDEV site with repository at {}",
+                source_site.repository_path
             );
+            println!("Planned generated DDEV root: ~/.ddev-workspaces/sites");
             if source_site.clone_database {
                 println!("Planned database clone from source DDEV site");
             }

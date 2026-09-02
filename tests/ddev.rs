@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use support::{commit, init_repo, run_cli_with_path_and_vars, run_git, stdout};
 use tempfile::TempDir;
 
-fn source_site_repository(source_env: &str, generated_env: &str) -> (TempDir, PathBuf) {
+fn source_site_repository() -> (TempDir, PathBuf) {
     let site = tempfile::tempdir().expect("source DDEV site");
     let repository = site.path().join("wp-content/plugins/fixture");
     fs::create_dir_all(&repository).expect("repository directory");
@@ -32,9 +32,7 @@ fn source_site_repository(source_env: &str, generated_env: &str) -> (TempDir, Pa
     fs::write(repository.join("README.md"), "fixture\n").expect("fixture source");
     fs::write(
         repository.join(".ddev-workspaces.toml"),
-        format!(
-            "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[ddev.source_site]\nsource_root_env = '{source_env}'\ngenerated_root_env = '{generated_env}'\nrepository_path = 'wp-content/plugins/fixture'\nclone_database = false\n"
-        ),
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[ddev.source_site]\nrepository_path = 'wp-content/plugins/fixture'\nclone_database = false\n",
     )
     .expect("workspace configuration");
     commit(&repository, "source site fixture");
@@ -71,7 +69,7 @@ fn source_site_creation_mounts_the_site_and_plugin_worktree_and_clones_database(
     fs::write(repository.join("README.md"), "fixture\n").expect("fixture source");
     fs::write(
         repository.join(".ddev-workspaces.toml"),
-        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[ddev.source_site]\nsource_root_env = 'FIXTURE_DDEV_SITE'\ngenerated_root_env = 'FIXTURE_DDEV_GENERATED_ROOT'\nrepository_path = 'wp-content/plugins/fixture'\nclone_database = true\n",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[ddev.source_site]\nrepository_path = 'wp-content/plugins/fixture'\nclone_database = true\n",
     )
     .expect("workspace configuration");
     commit(&repository, "source site fixture");
@@ -101,21 +99,14 @@ fn source_site_creation_mounts_the_site_and_plugin_worktree_and_clones_database(
 
     let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
     let generated_sites = tempfile::tempdir().expect("generated DDEV sites");
-    let generated_root = generated_sites.path().join("new/generated-root");
+    let generated_root = generated_sites.path().join(".ddev-workspaces/sites");
     let state = fake_state.path().join("running");
     let log = fake_state.path().join("calls.log");
     let fake_bin = support::fake_ddev_directory(&state);
     let variables = [
         ("DDEV_FAKE_NAME", "dw-fixture--nested"),
         ("DDEV_FAKE_LOG", log.to_str().expect("log path")),
-        (
-            "FIXTURE_DDEV_SITE",
-            site.path().to_str().expect("site path"),
-        ),
-        (
-            "FIXTURE_DDEV_GENERATED_ROOT",
-            generated_root.to_str().expect("generated site root"),
-        ),
+        ("HOME", generated_sites.path().to_str().expect("test home")),
     ];
     let output = run_cli_with_path_and_vars(
         &repository,
@@ -214,8 +205,7 @@ fn source_site_creation_mounts_the_site_and_plugin_worktree_and_clones_database(
 
 #[test]
 fn source_only_creation_in_source_site_mode_needs_no_ddev_environment() {
-    let (_site, repository) =
-        source_site_repository("SOURCE_ONLY_DDEV_SITE", "SOURCE_ONLY_GENERATED_ROOT");
+    let (_site, repository) = source_site_repository();
 
     let output = support::run_cli(
         &repository,
@@ -233,7 +223,7 @@ fn source_only_creation_in_source_site_mode_needs_no_ddev_environment() {
 fn source_site_creation_rejects_a_symlinked_source_ddev_directory_without_mutating_it() {
     use std::os::unix::fs::symlink;
 
-    let (site, repository) = source_site_repository("SYMLINK_DDEV_SITE", "SYMLINK_GENERATED_ROOT");
+    let (site, repository) = source_site_repository();
     let source_ddev = tempfile::tempdir().expect("source DDEV target");
     fs::remove_dir_all(site.path().join(".ddev")).expect("remove regular DDEV directory");
     fs::write(source_ddev.path().join("config.yaml"), "type: wordpress\n")
@@ -247,16 +237,7 @@ fn source_site_creation_rejects_a_symlinked_source_ddev_directory_without_mutati
         &repository,
         &["create", "--base", "HEAD", "unsafe"],
         fake_bin.path(),
-        &[
-            (
-                "SYMLINK_DDEV_SITE",
-                site.path().to_str().expect("source site"),
-            ),
-            (
-                "SYMLINK_GENERATED_ROOT",
-                generated.path().to_str().expect("generated root"),
-            ),
-        ],
+        &[("HOME", generated.path().to_str().expect("test home"))],
     );
     let text = format!("{}{}", stdout(&output), support::stderr(&output));
 
@@ -272,7 +253,7 @@ fn source_site_creation_rejects_a_symlinked_source_ddev_directory_without_mutati
 
 #[test]
 fn partial_source_site_creation_without_an_app_root_can_be_removed() {
-    let (site, repository) = source_site_repository("PARTIAL_DDEV_SITE", "PARTIAL_GENERATED_ROOT");
+    let (_site, repository) = source_site_repository();
     let generated = tempfile::tempdir().expect("generated root");
     let created = support::run_cli(
         &repository,
@@ -282,7 +263,8 @@ fn partial_source_site_creation_without_an_app_root_can_be_removed() {
 
     let record_path = repository.join(".git/ddev-workspaces/workspaces/partial.toml");
     let app_root = fs::canonicalize(generated.path())
-        .expect("canonical generated root")
+        .expect("canonical test home")
+        .join(".ddev-workspaces/sites")
         .join("fixture/partial");
     let mut record = fs::read_to_string(&record_path).expect("ownership record");
     record = record.replace("source_only = true", "source_only = false");
@@ -299,16 +281,7 @@ fn partial_source_site_creation_without_an_app_root_can_be_removed() {
         &repository,
         &["remove", "--confirm", "partial", "partial"],
         fake_bin.path(),
-        &[
-            (
-                "PARTIAL_DDEV_SITE",
-                site.path().to_str().expect("source site"),
-            ),
-            (
-                "PARTIAL_GENERATED_ROOT",
-                generated.path().to_str().expect("generated root"),
-            ),
-        ],
+        &[("HOME", generated.path().to_str().expect("test home"))],
     );
     let text = format!("{}{}", stdout(&removed), support::stderr(&removed));
 
@@ -319,24 +292,18 @@ fn partial_source_site_creation_without_an_app_root_can_be_removed() {
 
 #[test]
 fn removal_refuses_source_site_mode_drift_without_orphaning_owned_state() {
-    let (site, repository) = source_site_repository("DRIFT_DDEV_SITE", "DRIFT_GENERATED_ROOT");
+    let (_site, repository) = source_site_repository();
     let generated = tempfile::tempdir().expect("generated root");
     let generated_site = fs::canonicalize(generated.path())
-        .expect("canonical generated root")
+        .expect("canonical test home")
+        .join(".ddev-workspaces/sites")
         .join("fixture/drift");
     let fake_state = tempfile::tempdir().expect("fake DDEV state");
     let state = fake_state.path().join("running");
     let fake_bin = support::fake_ddev_directory(&state);
     let variables = [
         ("DDEV_FAKE_NAME", "dw-fixture--drift"),
-        (
-            "DRIFT_DDEV_SITE",
-            site.path().to_str().expect("source site"),
-        ),
-        (
-            "DRIFT_GENERATED_ROOT",
-            generated.path().to_str().expect("generated root"),
-        ),
+        ("HOME", generated.path().to_str().expect("test home")),
     ];
     let created = run_cli_with_path_and_vars(
         &repository,

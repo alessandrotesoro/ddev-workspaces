@@ -35,8 +35,6 @@ pub struct DdevConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSiteConfig {
-    pub source_root_env: String,
-    pub generated_root_env: String,
     pub repository_path: String,
     #[serde(default)]
     pub clone_database: bool,
@@ -141,8 +139,6 @@ impl ProjectConfig {
                 ));
             }
             if let Some(source_site) = &ddev.source_site {
-                validate_environment_name(&source_site.source_root_env)?;
-                validate_environment_name(&source_site.generated_root_env)?;
                 validate_repository_relative(
                     "ddev.source_site.repository_path",
                     &source_site.repository_path,
@@ -246,70 +242,58 @@ impl ProjectConfig {
     }
 }
 
-pub fn source_site_root(config: &SourceSiteConfig) -> ToolResult<PathBuf> {
-    let value = env::var_os(&config.source_root_env).ok_or_else(|| {
-        ToolError::new(format!(
-            "environment variable {} is required for ddev.source_site.source_root_env",
-            config.source_root_env
-        ))
-    })?;
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        return Err(ToolError::new(format!(
-            "environment variable {} must name an absolute DDEV site root",
-            config.source_root_env
-        )));
+pub fn source_site_root(repo_root: &Path) -> ToolResult<PathBuf> {
+    let canonical_repo_root = fs::canonicalize(repo_root)?;
+    for ancestor in canonical_repo_root.ancestors().skip(1) {
+        let ddev_directory = ancestor.join(".ddev");
+        let ddev_metadata = match fs::symlink_metadata(&ddev_directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ToolError::new(format!(
+                    "cannot inspect potential source DDEV site {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        };
+        if !ddev_metadata.is_dir() || ddev_metadata.file_type().is_symlink() {
+            return Err(ToolError::new(format!(
+                "source DDEV site {} must contain a regular non-symlink .ddev directory",
+                ancestor.display()
+            )));
+        }
+        let config_path = ddev_directory.join("config.yaml");
+        let config_metadata = fs::symlink_metadata(&config_path).map_err(|error| {
+            ToolError::new(format!(
+                "source DDEV site root {} has no usable .ddev/config.yaml: {error}",
+                ancestor.display()
+            ))
+        })?;
+        if !config_metadata.is_file() || config_metadata.file_type().is_symlink() {
+            return Err(ToolError::new(format!(
+                "source DDEV site root {} must contain a regular non-symlink .ddev/config.yaml",
+                ancestor.display()
+            )));
+        }
+        return Ok(ancestor.to_path_buf());
     }
-    let canonical = fs::canonicalize(&path).map_err(|error| {
-        ToolError::new(format!(
-            "source DDEV site root from {} is unavailable: {error}",
-            config.source_root_env
-        ))
-    })?;
-    let ddev_directory = canonical.join(".ddev");
-    let ddev_metadata = fs::symlink_metadata(&ddev_directory).map_err(|error| {
-        ToolError::new(format!(
-            "source DDEV site {} has no usable .ddev directory: {error}",
-            canonical.display()
-        ))
-    })?;
-    if !ddev_metadata.is_dir() || ddev_metadata.file_type().is_symlink() {
-        return Err(ToolError::new(format!(
-            "source DDEV site {} must contain a regular non-symlink .ddev directory",
-            canonical.display()
-        )));
-    }
-    if !canonical.join(".ddev/config.yaml").is_file() {
-        return Err(ToolError::new(format!(
-            "source DDEV site root {} is missing .ddev/config.yaml",
-            canonical.display()
-        )));
-    }
-    Ok(canonical)
+    Err(ToolError::new(format!(
+        "repository {} is not contained in a DDEV site; add a regular .ddev/config.yaml to a parent directory or remove ddev.source_site",
+        canonical_repo_root.display()
+    )))
 }
 
-pub fn source_generated_root(config: &SourceSiteConfig) -> ToolResult<PathBuf> {
-    let value = env::var_os(&config.generated_root_env).ok_or_else(|| {
-        ToolError::new(format!(
-            "environment variable {} is required for ddev.source_site.generated_root_env",
-            config.generated_root_env
-        ))
-    })?;
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        return Err(ToolError::new(format!(
-            "environment variable {} must name an absolute generated DDEV root",
-            config.generated_root_env
-        )));
-    }
+pub fn source_generated_root() -> ToolResult<PathBuf> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| ToolError::new("home directory is unavailable; HOME must be absolute"))?;
+    let path = home.join(".ddev-workspaces/sites");
     let existing = nearest_existing_parent(&path);
     let canonical_existing = fs::canonicalize(&existing)?;
-    let remainder = path.strip_prefix(&existing).map_err(|_| {
-        ToolError::new(format!(
-            "cannot resolve generated DDEV root from {}",
-            config.generated_root_env
-        ))
-    })?;
+    let remainder = path
+        .strip_prefix(&existing)
+        .map_err(|_| ToolError::new("cannot resolve the default generated DDEV root"))?;
     Ok(canonical_existing.join(remainder))
 }
 
@@ -318,8 +302,8 @@ pub fn resolve_source_site(
     config: &SourceSiteConfig,
     create_generated_root: bool,
 ) -> ToolResult<ResolvedSourceSite> {
-    let source_root = source_site_root(config)?;
-    let mut generated_root = source_generated_root(config)?;
+    let source_root = source_site_root(repo_root)?;
+    let mut generated_root = source_generated_root()?;
     if create_generated_root {
         create_directory_tree(&generated_root)?;
         generated_root = fs::canonicalize(&generated_root)?;
