@@ -1,8 +1,338 @@
 mod support;
 
 use std::fs;
+use std::path::PathBuf;
 
 use support::{commit, init_repo, run_cli_with_path_and_vars, run_git, stdout};
+use tempfile::TempDir;
+
+fn source_site_repository() -> (TempDir, PathBuf) {
+    let site = tempfile::tempdir().expect("source DDEV site");
+    let repository = site.path().join("wp-content/plugins/fixture");
+    fs::create_dir_all(&repository).expect("repository directory");
+    assert!(
+        run_git(&repository, &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(&repository, &["config", "user.name", "Fixture User"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(
+            &repository,
+            &["config", "user.email", "fixture@example.test"]
+        )
+        .status
+        .success()
+    );
+    fs::write(repository.join(".gitignore"), ".worktrees/\n").expect("ignore rule");
+    fs::write(repository.join("README.md"), "fixture\n").expect("fixture source");
+    fs::write(
+        repository.join(".ddev-workspaces.toml"),
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[ddev.source_site]\nrepository_path = 'wp-content/plugins/fixture'\nclone_database = false\n",
+    )
+    .expect("workspace configuration");
+    commit(&repository, "source site fixture");
+    fs::create_dir_all(site.path().join(".ddev")).expect("DDEV directory");
+    fs::write(site.path().join(".ddev/config.yaml"), "type: wordpress\n")
+        .expect("DDEV configuration");
+    (site, repository)
+}
+
+#[test]
+fn source_site_creation_mounts_the_site_and_plugin_worktree_and_clones_database() {
+    let site = tempfile::tempdir().expect("source DDEV site");
+    let repository = site.path().join("wp-content/plugins/fixture");
+    fs::create_dir_all(repository.join(".ddev-placeholder")).expect("repository directory");
+    assert!(
+        run_git(&repository, &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(&repository, &["config", "user.name", "Fixture User"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(
+            &repository,
+            &["config", "user.email", "fixture@example.test"]
+        )
+        .status
+        .success()
+    );
+    fs::write(repository.join(".gitignore"), ".worktrees/\n.ddev-site/\n").expect("ignore rules");
+    fs::write(repository.join("README.md"), "fixture\n").expect("fixture source");
+    fs::write(
+        repository.join(".ddev-workspaces.toml"),
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[ddev.source_site]\nrepository_path = 'wp-content/plugins/fixture'\nclone_database = true\n",
+    )
+    .expect("workspace configuration");
+    commit(&repository, "source site fixture");
+    fs::create_dir_all(site.path().join(".ddev")).expect("DDEV directory");
+    fs::write(site.path().join(".ddev/config.yaml"), "type: wordpress\n")
+        .expect("DDEV configuration");
+    fs::write(site.path().join("index.php"), "<?php // source site\n").expect("source site file");
+    fs::create_dir_all(site.path().join("wp-content/plugins/dependency/.git"))
+        .expect("dependency metadata");
+    fs::create_dir_all(
+        site.path()
+            .join("wp-content/plugins/dependency/node_modules"),
+    )
+    .expect("dependency node modules");
+    fs::write(
+        site.path().join("wp-content/plugins/dependency/plugin.php"),
+        "<?php // dependency\n",
+    )
+    .expect("dependency plugin");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        "plugin.php",
+        site.path()
+            .join("wp-content/plugins/dependency/plugin-link.php"),
+    )
+    .expect("safe relative dependency symlink");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
+    let generated_sites = tempfile::tempdir().expect("generated DDEV sites");
+    let generated_root = generated_sites.path().join(".ddev-workspaces/sites");
+    let state = fake_state.path().join("running");
+    let log = fake_state.path().join("calls.log");
+    let fake_bin = support::fake_ddev_directory(&state);
+    let variables = [
+        ("DDEV_FAKE_NAME", "dw-fixture--nested"),
+        ("DDEV_FAKE_LOG", log.to_str().expect("log path")),
+        ("HOME", generated_sites.path().to_str().expect("test home")),
+    ];
+    let output = run_cli_with_path_and_vars(
+        &repository,
+        &["create", "--base", "HEAD", "nested"],
+        fake_bin.path(),
+        &variables,
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+    assert!(output.status.success(), "{text}");
+    let workspace = repository.join(".worktrees/nested");
+    let generated_site = generated_root.join("fixture/nested");
+    let compose =
+        fs::read_to_string(generated_site.join(".ddev/docker-compose.ddev-workspaces.yaml"))
+            .expect("generated compose configuration");
+    let canonical_generated_site =
+        fs::canonicalize(&generated_site).expect("canonical generated site");
+
+    assert_eq!(
+        fs::read_to_string(generated_site.join("index.php")).expect("cloned site file"),
+        "<?php // source site\n"
+    );
+    assert!(
+        generated_site
+            .join("wp-content/plugins/dependency/plugin.php")
+            .is_file()
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(generated_site.join("wp-content/plugins/dependency/plugin-link.php"))
+            .expect("copied relative dependency symlink"),
+        PathBuf::from("plugin.php")
+    );
+    assert!(
+        !generated_site
+            .join("wp-content/plugins/dependency/.git")
+            .exists()
+    );
+    assert!(
+        !generated_site
+            .join("wp-content/plugins/dependency/node_modules")
+            .exists()
+    );
+    assert!(
+        !generated_site
+            .join("wp-content/plugins/fixture/README.md")
+            .exists()
+    );
+    assert_eq!(
+        compose
+            .lines()
+            .filter(|line| line.trim_start().starts_with('-'))
+            .count(),
+        1
+    );
+    assert!(compose.contains(&format!(
+        "{}:/var/www/html/wp-content/plugins/fixture",
+        workspace.display()
+    )));
+    let calls = fs::read_to_string(&log).expect("DDEV calls");
+    assert!(calls.lines().any(|line| line.starts_with("export-db ")));
+    assert!(calls.lines().any(|line| line.starts_with("import-db ")));
+
+    assert!(text.contains(&canonical_generated_site.display().to_string()));
+
+    let removal_preview = run_cli_with_path_and_vars(
+        &repository,
+        &["remove", "--dry-run", "nested"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(
+        removal_preview.status.success(),
+        "{}",
+        support::stderr(&removal_preview)
+    );
+    let preview_text = stdout(&removal_preview);
+    assert!(
+        preview_text.contains(&format!(
+            "Will recursively remove generated DDEV application {}.",
+            canonical_generated_site.display()
+        )),
+        "{preview_text}"
+    );
+
+    let removed = run_cli_with_path_and_vars(
+        &repository,
+        &["remove", "--confirm", "nested", "nested"],
+        fake_bin.path(),
+        &variables,
+    );
+    let removed_text = format!("{}{}", stdout(&removed), support::stderr(&removed));
+    assert!(removed.status.success(), "{removed_text}");
+    assert!(!workspace.exists());
+    assert!(!generated_site.exists());
+}
+
+#[test]
+fn source_only_creation_in_source_site_mode_needs_no_ddev_environment() {
+    let (_site, repository) = source_site_repository();
+
+    let output = support::run_cli(
+        &repository,
+        &["create", "--source-only", "--base", "HEAD", "source-only"],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert!(output.status.success(), "{text}");
+    assert!(repository.join(".worktrees/source-only").is_dir());
+    assert!(text.contains("DDEV: skipped by --source-only"));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_site_creation_rejects_a_symlinked_source_ddev_directory_without_mutating_it() {
+    use std::os::unix::fs::symlink;
+
+    let (site, repository) = source_site_repository();
+    let source_ddev = tempfile::tempdir().expect("source DDEV target");
+    fs::remove_dir_all(site.path().join(".ddev")).expect("remove regular DDEV directory");
+    fs::write(source_ddev.path().join("config.yaml"), "type: wordpress\n")
+        .expect("source DDEV config");
+    symlink(source_ddev.path(), site.path().join(".ddev")).expect("source DDEV symlink");
+    let generated = tempfile::tempdir().expect("generated root");
+    let fake_state = tempfile::tempdir().expect("fake DDEV state");
+    let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
+
+    let output = run_cli_with_path_and_vars(
+        &repository,
+        &["create", "--base", "HEAD", "unsafe"],
+        fake_bin.path(),
+        &[("HOME", generated.path().to_str().expect("test home"))],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("regular non-symlink .ddev directory"));
+    assert!(
+        !source_ddev
+            .path()
+            .join("docker-compose.ddev-workspaces.yaml")
+            .exists()
+    );
+}
+
+#[test]
+fn partial_source_site_creation_without_an_app_root_can_be_removed() {
+    let (_site, repository) = source_site_repository();
+    let generated = tempfile::tempdir().expect("generated root");
+    let created = support::run_cli(
+        &repository,
+        &["create", "--source-only", "--base", "HEAD", "partial"],
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let record_path = repository.join(".git/ddev-workspaces/workspaces/partial.toml");
+    let app_root = fs::canonicalize(generated.path())
+        .expect("canonical test home")
+        .join(".ddev-workspaces/sites")
+        .join("fixture/partial");
+    let mut record = fs::read_to_string(&record_path).expect("ownership record");
+    record = record.replace("source_only = true", "source_only = false");
+    record = record.replace("source_site = false", "source_site = true");
+    record.push_str(&format!(
+        "ddev_app_root = {:?}\n",
+        app_root.display().to_string()
+    ));
+    fs::write(&record_path, record).expect("partial ownership record");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state");
+    let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
+    let removed = run_cli_with_path_and_vars(
+        &repository,
+        &["remove", "--confirm", "partial", "partial"],
+        fake_bin.path(),
+        &[("HOME", generated.path().to_str().expect("test home"))],
+    );
+    let text = format!("{}{}", stdout(&removed), support::stderr(&removed));
+
+    assert!(removed.status.success(), "{text}");
+    assert!(!repository.join(".worktrees/partial").exists());
+    assert!(!record_path.exists());
+}
+
+#[test]
+fn removal_refuses_source_site_mode_drift_without_orphaning_owned_state() {
+    let (_site, repository) = source_site_repository();
+    let generated = tempfile::tempdir().expect("generated root");
+    let generated_site = fs::canonicalize(generated.path())
+        .expect("canonical test home")
+        .join(".ddev-workspaces/sites")
+        .join("fixture/drift");
+    let fake_state = tempfile::tempdir().expect("fake DDEV state");
+    let state = fake_state.path().join("running");
+    let fake_bin = support::fake_ddev_directory(&state);
+    let variables = [
+        ("DDEV_FAKE_NAME", "dw-fixture--drift"),
+        ("HOME", generated.path().to_str().expect("test home")),
+    ];
+    let created = run_cli_with_path_and_vars(
+        &repository,
+        &["create", "--base", "HEAD", "drift"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    fs::write(
+        repository.join(".ddev-workspaces.toml"),
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n",
+    )
+    .expect("plain DDEV configuration");
+    let removed = run_cli_with_path_and_vars(
+        &repository,
+        &["remove", "--confirm", "drift", "drift"],
+        fake_bin.path(),
+        &variables,
+    );
+    let text = format!("{}{}", stdout(&removed), support::stderr(&removed));
+    let record_path = repository.join(".git/ddev-workspaces/workspaces/drift.toml");
+
+    assert!(!removed.status.success(), "{text}");
+    assert!(text.contains("current DDEV mode differs from creation provenance"));
+    assert!(generated_site.exists());
+    assert!(repository.join(".worktrees/drift").exists());
+    assert!(record_path.exists());
+}
 
 #[test]
 fn doctor_does_not_let_ddev_prune_the_real_project_registry() {
@@ -123,6 +453,48 @@ fn full_creation_and_default_removal_use_the_exact_fake_identity() {
             .any(|line| line == "stop --unlist dw-fixture--task-1")
     );
     assert!(!calls.lines().any(|line| line.contains("delete")));
+}
+
+#[test]
+fn list_recognizes_a_standard_workspace_with_a_dot_app_root() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n",
+    );
+    support::write_tracked_file(repository.path(), ".ddev/config.yaml", "name: fixture\n");
+    commit(repository.path(), "add DDEV list fixture");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
+    let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
+    let variables = [("DDEV_FAKE_NAME", "dw-fixture--listed")];
+    let created = run_cli_with_path_and_vars(
+        repository.path(),
+        &["create", "--base", "HEAD", "listed"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let workspace = repository.path().join(".worktrees/listed");
+    let list_variables = [
+        ("DDEV_FAKE_NAME", "dw-fixture--listed"),
+        (
+            "DDEV_FAKE_APPROOT",
+            workspace.to_str().expect("workspace path"),
+        ),
+    ];
+    let listed = run_cli_with_path_and_vars(
+        repository.path(),
+        &["list"],
+        fake_bin.path(),
+        &list_variables,
+    );
+    let listed_text = format!("{}{}", stdout(&listed), support::stderr(&listed));
+
+    assert!(listed.status.success(), "{listed_text}");
+    assert!(listed_text.contains("listed: READY"), "{listed_text}");
 }
 
 #[test]

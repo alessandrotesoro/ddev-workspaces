@@ -28,6 +28,22 @@ pub struct ProjectConfig {
 #[serde(deny_unknown_fields)]
 pub struct DdevConfig {
     pub app_root: String,
+    #[serde(default)]
+    pub source_site: Option<SourceSiteConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSiteConfig {
+    pub repository_path: String,
+    #[serde(default)]
+    pub clone_database: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSourceSite {
+    pub source_root: PathBuf,
+    pub generated_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -80,6 +96,22 @@ impl ProjectConfig {
     }
 
     pub fn validate<R: CommandRunner>(&self, repo_root: &Path, runner: &mut R) -> ToolResult<()> {
+        self.validate_structure(repo_root, runner)?;
+        if let Some(source_site) = self
+            .ddev
+            .as_ref()
+            .and_then(|ddev| ddev.source_site.as_ref())
+        {
+            resolve_source_site(repo_root, source_site, false)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_structure<R: CommandRunner>(
+        &self,
+        repo_root: &Path,
+        runner: &mut R,
+    ) -> ToolResult<()> {
         if self.version != 1 {
             return Err(ToolError::new(format!(
                 "configuration field `version` must be integer 1, found {}; update {}",
@@ -105,6 +137,12 @@ impl ProjectConfig {
                 return Err(ToolError::new(
                     "configuration field `ddev.app_root` resolves through a symlinked .ddev directory",
                 ));
+            }
+            if let Some(source_site) = &ddev.source_site {
+                validate_repository_relative(
+                    "ddev.source_site.repository_path",
+                    &source_site.repository_path,
+                )?;
             }
         }
 
@@ -204,6 +242,134 @@ impl ProjectConfig {
     }
 }
 
+pub fn source_site_root(repo_root: &Path) -> ToolResult<PathBuf> {
+    let canonical_repo_root = fs::canonicalize(repo_root)?;
+    for ancestor in canonical_repo_root.ancestors().skip(1) {
+        let ddev_directory = ancestor.join(".ddev");
+        let ddev_metadata = match fs::symlink_metadata(&ddev_directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ToolError::new(format!(
+                    "cannot inspect potential source DDEV site {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        };
+        if !ddev_metadata.is_dir() || ddev_metadata.file_type().is_symlink() {
+            return Err(ToolError::new(format!(
+                "source DDEV site {} must contain a regular non-symlink .ddev directory",
+                ancestor.display()
+            )));
+        }
+        let config_path = ddev_directory.join("config.yaml");
+        let config_metadata = fs::symlink_metadata(&config_path).map_err(|error| {
+            ToolError::new(format!(
+                "source DDEV site root {} has no usable .ddev/config.yaml: {error}",
+                ancestor.display()
+            ))
+        })?;
+        if !config_metadata.is_file() || config_metadata.file_type().is_symlink() {
+            return Err(ToolError::new(format!(
+                "source DDEV site root {} must contain a regular non-symlink .ddev/config.yaml",
+                ancestor.display()
+            )));
+        }
+        return Ok(ancestor.to_path_buf());
+    }
+    Err(ToolError::new(format!(
+        "repository {} is not contained in a DDEV site; add a regular .ddev/config.yaml to a parent directory or remove ddev.source_site",
+        canonical_repo_root.display()
+    )))
+}
+
+pub fn source_generated_root() -> ToolResult<PathBuf> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| ToolError::new("home directory is unavailable; HOME must be absolute"))?;
+    let path = home.join(".ddev-workspaces/sites");
+    let existing = nearest_existing_parent(&path);
+    let canonical_existing = fs::canonicalize(&existing)?;
+    let remainder = path
+        .strip_prefix(&existing)
+        .map_err(|_| ToolError::new("cannot resolve the default generated DDEV root"))?;
+    Ok(canonical_existing.join(remainder))
+}
+
+pub fn resolve_source_site(
+    repo_root: &Path,
+    config: &SourceSiteConfig,
+    create_generated_root: bool,
+) -> ToolResult<ResolvedSourceSite> {
+    let source_root = source_site_root(repo_root)?;
+    let mut generated_root = source_generated_root()?;
+    if create_generated_root {
+        create_directory_tree(&generated_root)?;
+        generated_root = fs::canonicalize(&generated_root)?;
+    }
+    if generated_root.starts_with(&source_root) || source_root.starts_with(&generated_root) {
+        return Err(ToolError::new(format!(
+            "generated DDEV root {} must be outside source DDEV site {}",
+            generated_root.display(),
+            source_root.display()
+        )));
+    }
+    let declared_repository = safe_join(&source_root, &config.repository_path)?;
+    let canonical_repository = fs::canonicalize(&declared_repository).map_err(|error| {
+        ToolError::new(format!(
+            "source DDEV site repository path {} is unavailable: {error}",
+            declared_repository.display()
+        ))
+    })?;
+    let canonical_repo_root = fs::canonicalize(repo_root)?;
+    if canonical_repository != canonical_repo_root {
+        return Err(ToolError::new(format!(
+            "ddev.source_site.repository_path resolves to {}, not this repository {}; refusing an unproven mount",
+            canonical_repository.display(),
+            canonical_repo_root.display()
+        )));
+    }
+    Ok(ResolvedSourceSite {
+        source_root,
+        generated_root,
+    })
+}
+
+fn create_directory_tree(path: &Path) -> ToolResult<()> {
+    let existing = nearest_existing_parent(path);
+    let mut current = fs::canonicalize(&existing)?;
+    let remainder = path.strip_prefix(&existing).map_err(|_| {
+        ToolError::new(format!(
+            "cannot prepare generated DDEV root {}",
+            path.display()
+        ))
+    })?;
+    for component in remainder.components() {
+        let Component::Normal(part) = component else {
+            return Err(ToolError::new(format!(
+                "generated DDEV root {} contains an unsupported path component",
+                path.display()
+            )));
+        };
+        current.push(part);
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&current)?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(ToolError::new(format!(
+                        "generated DDEV root component {} is not a regular directory",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_name(field: &str, value: &str) -> ToolResult<()> {
     let valid_first = value
         .as_bytes()
@@ -290,7 +456,7 @@ pub fn safe_join(root: &Path, relative: &str) -> ToolResult<PathBuf> {
     Ok(candidate)
 }
 
-fn normalize_relative_path(relative: &str) -> PathBuf {
+pub fn normalize_relative_path(relative: &str) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in Path::new(relative).components() {
         match component {
@@ -707,6 +873,7 @@ mod tests {
         let mut config = valid_config();
         config.ddev = Some(DdevConfig {
             app_root: "app".to_owned(),
+            source_site: None,
         });
         let error = config
             .validate(

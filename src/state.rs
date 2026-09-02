@@ -20,6 +20,18 @@ pub struct OwnershipRecord {
     pub ddev_name: String,
     pub source_only: bool,
     pub ddev_app_root: Option<String>,
+    #[serde(default)]
+    pub source_site: bool,
+}
+
+impl OwnershipRecord {
+    pub fn uses_source_site(&self) -> bool {
+        self.source_site
+            || self
+                .ddev_app_root
+                .as_deref()
+                .is_some_and(|root| Path::new(root).is_absolute())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +248,7 @@ mod tests {
             ddev_name: "dw-fixture--task-1".to_owned(),
             source_only: false,
             ddev_app_root: Some(".".to_owned()),
+            source_site: false,
         }
     }
 
