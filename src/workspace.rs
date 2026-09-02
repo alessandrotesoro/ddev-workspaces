@@ -441,17 +441,18 @@ fn print_list_entry<R: CommandRunner>(
         return false;
     }
     let current_ddev_app_root = match configured_ddev_app_root(config, &path, &entry.name, None) {
-        Ok(app_root) => app_root.map(|path| path.display().to_string()),
+        Ok(app_root) => app_root,
         Err(error) => {
             println!("{}: NOT READY — {error}", entry.name);
             return false;
         }
     };
-    let recorded_matches = record.ddev_app_root.as_deref().is_some_and(|recorded| {
-        recorded_app_root(&path, recorded)
-            .is_ok_and(|path| Some(path.display().to_string()) == current_ddev_app_root)
-    }) || (record.ddev_app_root.is_none()
-        && current_ddev_app_root.is_none());
+    let recorded_matches = record
+        .ddev_app_root
+        .as_deref()
+        .map(|recorded| recorded_app_root(&path, recorded))
+        .transpose()
+        .is_ok_and(|recorded| recorded == current_ddev_app_root);
     if !recorded_matches {
         println!(
             "{}: NOT READY — current DDEV app root differs from creation provenance",
@@ -582,6 +583,23 @@ fn create(arguments: &ArgMatches) -> ToolResult<u8> {
         return Ok(0);
     }
 
+    let ddev_app_root = if source_only {
+        None
+    } else if let Some(ddev_config) = &project_config.ddev {
+        if ddev_config.external_site.is_some() {
+            Some(
+                app_root
+                    .as_ref()
+                    .ok_or_else(|| ToolError::new("configured external DDEV root is missing"))?
+                    .display()
+                    .to_string(),
+            )
+        } else {
+            Some(ddev_config.app_root.clone())
+        }
+    } else {
+        None
+    };
     let record = OwnershipRecord {
         version: 1,
         project_id: project_config.project_id.clone(),
@@ -592,21 +610,7 @@ fn create(arguments: &ArgMatches) -> ToolResult<u8> {
         ddev_name,
         source_only,
         external_ddev_site: resolved_external.is_some(),
-        ddev_app_root: if source_only {
-            None
-        } else {
-            project_config.ddev.as_ref().map(|ddev_config| {
-                if ddev_config.external_site.is_some() {
-                    app_root
-                        .as_ref()
-                        .expect("configured external DDEV root")
-                        .display()
-                        .to_string()
-                } else {
-                    ddev_config.app_root.clone()
-                }
-            })
-        },
+        ddev_app_root,
     };
     let record_path = state::reserve(&repository.common_dir, &record)?;
     match create_after_reservation(
@@ -1363,7 +1367,12 @@ fn configured_ddev_app_root(
     }
     // The worktree does not exist yet during creation preflight. Configuration
     // validation has already proved that app_root is repository-relative.
-    Ok(Some(workspace.join(&ddev_config.app_root)))
+    let app_relative = config::normalize_relative_path(&ddev_config.app_root);
+    if app_relative.as_os_str().is_empty() {
+        Ok(Some(workspace.to_path_buf()))
+    } else {
+        Ok(Some(workspace.join(app_relative)))
+    }
 }
 
 fn recorded_app_root(workspace: &Path, recorded: &str) -> ToolResult<PathBuf> {

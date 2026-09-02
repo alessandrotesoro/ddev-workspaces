@@ -396,15 +396,15 @@ fn reserve_external_app_root(generated_root: &Path, app_root: &Path) -> ToolResu
         ))
     })?;
     let mut current = generated_root;
-    let components = relative.components().collect::<Vec<_>>();
-    for (index, component) in components.iter().enumerate() {
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
         let std::path::Component::Normal(part) = component else {
             return Err(ToolError::new(
                 "external DDEV app root contains an unsafe component",
             ));
         };
         current.push(part);
-        let is_app_root = index + 1 == components.len();
+        let is_app_root = components.peek().is_none();
         match fs::create_dir(&current) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && !is_app_root => {

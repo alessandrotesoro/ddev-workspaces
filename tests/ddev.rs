@@ -492,6 +492,48 @@ fn full_creation_and_default_removal_use_the_exact_fake_identity() {
 }
 
 #[test]
+fn list_recognizes_a_standard_workspace_with_a_dot_app_root() {
+    let repository = init_repo();
+    support::write_tracked_file(
+        repository.path(),
+        ".ddev-workspaces.toml",
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n",
+    );
+    support::write_tracked_file(repository.path(), ".ddev/config.yaml", "name: fixture\n");
+    commit(repository.path(), "add DDEV list fixture");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
+    let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
+    let variables = [("DDEV_FAKE_NAME", "dw-fixture--listed")];
+    let created = run_cli_with_path_and_vars(
+        repository.path(),
+        &["create", "--base", "HEAD", "listed"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let workspace = repository.path().join(".worktrees/listed");
+    let list_variables = [
+        ("DDEV_FAKE_NAME", "dw-fixture--listed"),
+        (
+            "DDEV_FAKE_APPROOT",
+            workspace.to_str().expect("workspace path"),
+        ),
+    ];
+    let listed = run_cli_with_path_and_vars(
+        repository.path(),
+        &["list"],
+        fake_bin.path(),
+        &list_variables,
+    );
+    let listed_text = format!("{}{}", stdout(&listed), support::stderr(&listed));
+
+    assert!(listed.status.success(), "{listed_text}");
+    assert!(listed_text.contains("listed: READY"), "{listed_text}");
+}
+
+#[test]
 fn doctor_keeps_full_workspace_runtime_and_ddev_checks() {
     let repository = init_repo();
     support::write_tracked_file(
