@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::ArgMatches;
 
 use crate::command::{CommandRunner, RealCommandRunner, ToolError, ToolResult};
-use crate::config::{self, CheckRule, CommandRule, ProjectConfig};
+use crate::config::{self, CheckRule, CommandRule, ProjectConfig, ResolvedExternalSite};
 use crate::ddev::{self, DdevProject};
 use crate::git::{self, GitRepository, SourceDiagnostics};
 use crate::state::{self, OwnershipRecord, RecordEntry};
@@ -40,8 +40,15 @@ fn doctor(arguments: &ArgMatches) -> ToolResult<u8> {
         println!("Ownership: NOT READY — {issue}");
     }
 
+    let source_only_record = managed_record
+        .as_ref()
+        .is_some_and(|(_, record)| record.source_only);
     let config_result = ProjectConfig::load(&repository.main_worktree).and_then(|config| {
-        config.validate(&repository.main_worktree, &mut runner)?;
+        if source_only_record {
+            config.validate_structure(&repository.main_worktree, &mut runner)?;
+        } else {
+            config.validate(&repository.main_worktree, &mut runner)?;
+        }
         Ok(config)
     });
     let config_ready = match config_result {
@@ -80,7 +87,21 @@ fn doctor(arguments: &ArgMatches) -> ToolResult<u8> {
             if source_only_ready {
                 println!("DDEV: skipped by --source-only");
             } else if let Some(ddev_config) = &config.ddev {
-                let app_root = config::safe_join(&repository.root, &ddev_config.app_root)?;
+                let app_root = if let Some((_, record)) = &managed_record {
+                    record
+                        .ddev_app_root
+                        .as_deref()
+                        .map(|value| recorded_app_root(&repository.root, value))
+                        .transpose()?
+                        .ok_or_else(|| ToolError::new("managed DDEV workspace has no app root"))?
+                } else {
+                    ddev_config
+                        .external_site
+                        .as_ref()
+                        .map(config::external_site_root)
+                        .transpose()?
+                        .unwrap_or(config::safe_join(&repository.root, &ddev_config.app_root)?)
+                };
                 match ddev::list(&mut runner, &app_root) {
                     Ok(inspection) => {
                         for warning in &inspection.warnings {
@@ -192,8 +213,15 @@ fn list(_arguments: &ArgMatches) -> ToolResult<u8> {
         return Ok(0);
     }
 
+    let only_source_only = entries
+        .iter()
+        .all(|entry| entry.record.as_ref().is_ok_and(|record| record.source_only));
     let config_result = ProjectConfig::load(manager_root).and_then(|config| {
-        config.validate(manager_root, &mut runner)?;
+        if only_source_only {
+            config.validate_structure(manager_root, &mut runner)?;
+        } else {
+            config.validate(manager_root, &mut runner)?;
+        }
         Ok(config)
     });
     let config = config_result.as_ref().ok();
@@ -412,25 +440,33 @@ fn print_list_entry<R: CommandRunner>(
         println!("{}: NOT READY — {reason}", entry.name);
         return false;
     }
-    let current_ddev_app_root = config
-        .ddev
-        .as_ref()
-        .map(|ddev_config| ddev_config.app_root.as_str());
-    if record.ddev_app_root.as_deref() != current_ddev_app_root {
+    let current_ddev_app_root = match configured_ddev_app_root(config, &path, &entry.name, None) {
+        Ok(app_root) => app_root.map(|path| path.display().to_string()),
+        Err(error) => {
+            println!("{}: NOT READY — {error}", entry.name);
+            return false;
+        }
+    };
+    let recorded_matches = record.ddev_app_root.as_deref().is_some_and(|recorded| {
+        recorded_app_root(&path, recorded)
+            .is_ok_and(|path| Some(path.display().to_string()) == current_ddev_app_root)
+    }) || (record.ddev_app_root.is_none()
+        && current_ddev_app_root.is_none());
+    if !recorded_matches {
         println!(
             "{}: NOT READY — current DDEV app root differs from creation provenance",
             entry.name
         );
         return false;
     }
-    let Some(recorded_app_root) = &record.ddev_app_root else {
+    let Some(recorded_root) = &record.ddev_app_root else {
         println!(
             "{}: READY — source and configured non-DDEV checks pass",
             entry.name
         );
         return true;
     };
-    let app_root = match config::safe_join(&path, recorded_app_root) {
+    let app_root = match recorded_app_root(&path, recorded_root) {
         Ok(app_root) => app_root,
         Err(error) => {
             println!("{}: NOT READY — {error}", entry.name);
@@ -455,7 +491,12 @@ fn print_list_entry<R: CommandRunner>(
         Ok(Some(_))
             if ddev::require_ready_identity(inspection, &record.ddev_name, &app_root).is_ok() =>
         {
-            println!("{}: READY — running at {}", entry.name, path.display());
+            println!(
+                "{}: READY — running at {} (worktree {})",
+                entry.name,
+                app_root.display(),
+                path.display()
+            );
             true
         }
         Ok(Some(_)) => {
@@ -492,7 +533,7 @@ fn create(arguments: &ArgMatches) -> ToolResult<u8> {
     let repository = GitRepository::discover(Path::new("."), &mut runner)?;
     let manager_root = repository.main_worktree.clone();
     let project_config = ProjectConfig::load(&manager_root)?;
-    project_config.validate(&manager_root, &mut runner)?;
+    project_config.validate_structure(&manager_root, &mut runner)?;
     let base = repository.resolve_base(requested_base, &mut runner)?;
     let workspace_root = config::safe_join(&manager_root, &project_config.workspace_root)?;
     let workspace = workspace_root.join(name);
@@ -508,14 +549,26 @@ fn create(arguments: &ArgMatches) -> ToolResult<u8> {
         }
     }
 
-    let app_root = (!source_only)
-        .then(|| {
-            project_config
-                .ddev
-                .as_ref()
-                .map(|ddev_config| workspace.join(&ddev_config.app_root))
-        })
-        .flatten();
+    let resolved_external = if source_only {
+        None
+    } else {
+        project_config
+            .ddev
+            .as_ref()
+            .and_then(|ddev| ddev.external_site.as_ref())
+            .map(|external| config::resolve_external_site(&manager_root, external, !dry_run))
+            .transpose()?
+    };
+    let app_root = if source_only {
+        None
+    } else {
+        configured_ddev_app_root(
+            &project_config,
+            &workspace,
+            name,
+            resolved_external.as_ref(),
+        )?
+    };
     if let Some(app_root) = &app_root {
         let inspection = ddev::list(&mut runner, &manager_root)?;
         ddev::inspect_new_identity(&inspection, &ddev_name, app_root)?;
@@ -538,13 +591,21 @@ fn create(arguments: &ArgMatches) -> ToolResult<u8> {
         branch: name.to_owned(),
         ddev_name,
         source_only,
+        external_ddev_site: resolved_external.is_some(),
         ddev_app_root: if source_only {
             None
         } else {
-            project_config
-                .ddev
-                .as_ref()
-                .map(|ddev_config| ddev_config.app_root.clone())
+            project_config.ddev.as_ref().map(|ddev_config| {
+                if ddev_config.external_site.is_some() {
+                    app_root
+                        .as_ref()
+                        .expect("configured external DDEV root")
+                        .display()
+                        .to_string()
+                } else {
+                    ddev_config.app_root.clone()
+                }
+            })
         },
     };
     let record_path = state::reserve(&repository.common_dir, &record)?;
@@ -554,7 +615,7 @@ fn create(arguments: &ArgMatches) -> ToolResult<u8> {
         &record,
         &workspace,
         &base,
-        source_only,
+        resolved_external.as_ref(),
         &mut runner,
     ) {
         Ok(()) => Ok(0),
@@ -568,7 +629,7 @@ fn create_after_reservation<R: CommandRunner>(
     record: &OwnershipRecord,
     workspace: &Path,
     base: &git::BaseRevision,
-    source_only: bool,
+    resolved_external: Option<&ResolvedExternalSite>,
     runner: &mut R,
 ) -> ToolResult<()> {
     repository.add_worktree(workspace, &record.branch, &base.sha, runner)?;
@@ -583,7 +644,7 @@ fn create_after_reservation<R: CommandRunner>(
         println!("Cleanup report: {warning}");
     }
     println!("Source: READY");
-    if source_only {
+    if record.source_only {
         println!("Runtime: skipped by --source-only");
         println!("DDEV: skipped by --source-only");
         println!("READY — source-only workspace");
@@ -592,16 +653,41 @@ fn create_after_reservation<R: CommandRunner>(
 
     prepare_files(project_config, workspace, &workspace_repository, runner)?;
     if let Some(ddev_config) = &project_config.ddev {
-        let app_root = config::safe_join(workspace, &ddev_config.app_root)?;
+        let recorded = record
+            .ddev_app_root
+            .as_deref()
+            .ok_or_else(|| ToolError::new("DDEV ownership record has no app root"))?;
+        let app_root = recorded_app_root(workspace, recorded)?;
+        if let Some(external) = &ddev_config.external_site {
+            let resolved = resolved_external.ok_or_else(|| {
+                ToolError::new("external DDEV paths were not resolved during creation preflight")
+            })?;
+            ddev::prepare_external_site(
+                workspace,
+                &app_root,
+                &resolved.generated_root,
+                &resolved.source_root,
+                &external.repository_path,
+            )?;
+        }
         let inspection = ddev::list(runner, workspace)?;
         ddev::inspect_new_identity(&inspection, &record.ddev_name, &app_root)?;
         ddev::write_override(
             &workspace_repository.root,
             &app_root,
             &record.ddev_name,
+            ddev_config.external_site.is_some(),
             runner,
         )?;
         ddev::start(&app_root, runner)?;
+        if let Some(external) = &ddev_config.external_site
+            && external.clone_database
+        {
+            let source_root = &resolved_external
+                .ok_or_else(|| ToolError::new("external DDEV paths are unavailable"))?
+                .source_root;
+            ddev::clone_database(source_root, &app_root, runner)?;
+        }
         let after_start = ddev::list(runner, &app_root)?;
         ddev::require_ready_identity(&after_start, &record.ddev_name, &app_root)?;
     }
@@ -616,8 +702,12 @@ fn create_after_reservation<R: CommandRunner>(
     for warning in &source.warnings {
         println!("Cleanup report: {warning}");
     }
-    let ddev_project = if let Some(ddev_config) = &project_config.ddev {
-        let app_root = config::safe_join(workspace, &ddev_config.app_root)?;
+    let ddev_project = if project_config.ddev.is_some() {
+        let recorded = record
+            .ddev_app_root
+            .as_deref()
+            .ok_or_else(|| ToolError::new("DDEV ownership record has no app root"))?;
+        let app_root = recorded_app_root(workspace, recorded)?;
         let after_commands = ddev::list(runner, &app_root)?;
         Some(ddev::require_ready_identity(
             &after_commands,
@@ -668,11 +758,23 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
     let repository = GitRepository::discover(Path::new("."), &mut runner)?;
     let manager_root = repository.main_worktree.clone();
     let project_config = ProjectConfig::load(&manager_root)?;
-    project_config.validate(&manager_root, &mut runner)?;
     let (record_path, record) = state::load(&repository.common_dir, name)?;
+    if record.source_only {
+        project_config.validate_structure(&manager_root, &mut runner)?;
+    } else {
+        project_config.validate(&manager_root, &mut runner)?;
+    }
     let target = verify_removal_target(&repository, &project_config, name, &record, &mut runner)?;
 
     println!("Will remove managed worktree {}.", target.path.display());
+    if target.external_app_root
+        && let Some(app_root) = &target.app_root
+    {
+        println!(
+            "Will recursively remove generated DDEV application {}.",
+            app_root.display()
+        );
+    }
     if target.ddev.is_some() {
         if delete_data {
             println!(
@@ -718,7 +820,7 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
         &current_record,
         &mut runner,
     )?;
-    if let Some((_, app_root)) = &current.ddev {
+    if let (Some(_), Some(app_root)) = (&current.ddev, &current.app_root) {
         ddev::stop_unlist(
             app_root,
             &current_record.ddev_name,
@@ -741,6 +843,28 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
         &latest_record,
         &mut runner,
     )?;
+    if second_check.external_app_root
+        && let Some(app_root) = &second_check.app_root
+    {
+        match fs::symlink_metadata(app_root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(app_root).map_err(|error| {
+                    ToolError::new(format!(
+                        "cannot remove owned external DDEV app root {}: {error}",
+                        app_root.display()
+                    ))
+                })?;
+            }
+            Ok(_) => {
+                return Err(ToolError::new(format!(
+                    "owned external DDEV app root {} is not a regular directory; refusing removal",
+                    app_root.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     repository.remove_worktree(&second_check.path, &mut runner)?;
     state::delete(&latest_record_path)?;
     println!("READY — managed workspace removed; branch retained");
@@ -750,7 +874,9 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
 #[derive(Debug)]
 struct RemovalTarget {
     path: PathBuf,
-    ddev: Option<(DdevProject, PathBuf)>,
+    ddev: Option<DdevProject>,
+    app_root: Option<PathBuf>,
+    external_app_root: bool,
 }
 
 fn reload_removal_state<R: CommandRunner>(
@@ -762,7 +888,11 @@ fn reload_removal_state<R: CommandRunner>(
     runner: &mut R,
 ) -> ToolResult<(PathBuf, ProjectConfig, OwnershipRecord)> {
     let config = ProjectConfig::load(&repository.main_worktree)?;
-    config.validate(&repository.main_worktree, runner)?;
+    if expected_record.source_only {
+        config.validate_structure(&repository.main_worktree, runner)?;
+    } else {
+        config.validate(&repository.main_worktree, runner)?;
+    }
     let (record_path, record) = state::load(&repository.common_dir, name)?;
     if record_path != expected_record_path
         || &record != expected_record
@@ -867,15 +997,49 @@ fn verify_removal_target<R: CommandRunner>(
             "source-only ownership record unexpectedly includes a DDEV app root; refusing removal",
         ));
     }
-    let ddev = if let Some(recorded_app_root) = &record.ddev_app_root {
-        let app_root = config::safe_join(&path, recorded_app_root)?;
-        let inspection = ddev::list(runner, &app_root)?;
-        find_owned_ddev(&inspection.entries, &record.ddev_name, &app_root)?
-            .map(|project| (project, app_root))
+    let configured_external = project_config
+        .ddev
+        .as_ref()
+        .is_some_and(|ddev_config| ddev_config.external_site.is_some());
+    let recorded_external = record.owns_external_ddev_site();
+    if !record.source_only && recorded_external != configured_external {
+        return Err(ToolError::new(
+            "current DDEV mode differs from creation provenance; restore the external-site configuration before removal",
+        ));
+    }
+    if !record.source_only && configured_external {
+        let configured_app_root = configured_ddev_app_root(project_config, &path, name, None)?;
+        let owned_app_root = record
+            .ddev_app_root
+            .as_deref()
+            .map(|recorded| recorded_app_root(&path, recorded))
+            .transpose()?;
+        if owned_app_root != configured_app_root {
+            return Err(ToolError::new(
+                "owned external DDEV app root differs from the current configuration; refusing removal",
+            ));
+        }
+    }
+    let (ddev, app_root) = if let Some(recorded_root) = &record.ddev_app_root {
+        let app_root = recorded_app_root(&path, recorded_root)?;
+        if recorded_external && !app_root.exists() {
+            (None, Some(app_root))
+        } else {
+            let inspection = ddev::list(runner, &app_root)?;
+            (
+                find_owned_ddev(&inspection.entries, &record.ddev_name, &app_root)?,
+                Some(app_root),
+            )
+        }
     } else {
-        None
+        (None, None)
     };
-    Ok(RemovalTarget { path, ddev })
+    Ok(RemovalTarget {
+        path,
+        ddev,
+        app_root,
+        external_app_root: recorded_external,
+    })
 }
 
 fn find_owned_ddev(
@@ -1177,6 +1341,40 @@ fn ensure_workspace_path(workspace_root: &Path, workspace: &Path) -> ToolResult<
     Ok(())
 }
 
+fn configured_ddev_app_root(
+    project_config: &ProjectConfig,
+    workspace: &Path,
+    workspace_name: &str,
+    resolved_external: Option<&ResolvedExternalSite>,
+) -> ToolResult<Option<PathBuf>> {
+    let Some(ddev_config) = &project_config.ddev else {
+        return Ok(None);
+    };
+    if let Some(external) = &ddev_config.external_site {
+        let generated_root = resolved_external
+            .map(|resolved| resolved.generated_root.clone())
+            .unwrap_or(config::external_generated_root(external)?);
+        let mut relative = PathBuf::from(&project_config.project_id).join(workspace_name);
+        let app_relative = config::normalize_relative_path(&ddev_config.app_root);
+        if !app_relative.as_os_str().is_empty() {
+            relative.push(app_relative);
+        }
+        return Ok(Some(generated_root.join(relative)));
+    }
+    // The worktree does not exist yet during creation preflight. Configuration
+    // validation has already proved that app_root is repository-relative.
+    Ok(Some(workspace.join(&ddev_config.app_root)))
+}
+
+fn recorded_app_root(workspace: &Path, recorded: &str) -> ToolResult<PathBuf> {
+    let path = Path::new(recorded);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        config::safe_join(workspace, recorded)
+    }
+}
+
 fn ensure_regular_file(path: &Path, label: &str) -> ToolResult<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         ToolError::new(format!(
@@ -1280,6 +1478,19 @@ fn print_create_dry_run(
         println!("DDEV: skipped by --source-only");
     } else if project_config.ddev.is_some() {
         println!("Planned DDEV identity: {ddev_name}");
+        if let Some(external) = project_config
+            .ddev
+            .as_ref()
+            .and_then(|ddev| ddev.external_site.as_ref())
+        {
+            println!(
+                "Planned external DDEV site mount: ${} with repository at {}",
+                external.source_root_env, external.repository_path
+            );
+            if external.clone_database {
+                println!("Planned database clone from external DDEV site");
+            }
+        }
     } else {
         println!("DDEV: skipped (not configured)");
     }

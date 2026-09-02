@@ -1,8 +1,374 @@
 mod support;
 
 use std::fs;
+use std::path::PathBuf;
 
 use support::{commit, init_repo, run_cli_with_path_and_vars, run_git, stdout};
+use tempfile::TempDir;
+
+fn external_repository(source_env: &str, generated_env: &str) -> (TempDir, PathBuf) {
+    let site = tempfile::tempdir().expect("external DDEV site");
+    let repository = site.path().join("wp-content/plugins/fixture");
+    fs::create_dir_all(&repository).expect("repository directory");
+    assert!(
+        run_git(&repository, &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(&repository, &["config", "user.name", "Fixture User"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(
+            &repository,
+            &["config", "user.email", "fixture@example.test"]
+        )
+        .status
+        .success()
+    );
+    fs::write(repository.join(".gitignore"), ".worktrees/\n").expect("ignore rule");
+    fs::write(repository.join("README.md"), "fixture\n").expect("fixture source");
+    fs::write(
+        repository.join(".ddev-workspaces.toml"),
+        format!(
+            "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[ddev.external_site]\nsource_root_env = '{source_env}'\ngenerated_root_env = '{generated_env}'\nrepository_path = 'wp-content/plugins/fixture'\nclone_database = false\n"
+        ),
+    )
+    .expect("workspace configuration");
+    commit(&repository, "external site fixture");
+    fs::create_dir_all(site.path().join(".ddev")).expect("DDEV directory");
+    fs::write(site.path().join(".ddev/config.yaml"), "type: wordpress\n")
+        .expect("DDEV configuration");
+    (site, repository)
+}
+
+#[test]
+fn external_site_creation_mounts_the_site_and_plugin_worktree_and_clones_database() {
+    let site = tempfile::tempdir().expect("external DDEV site");
+    let repository = site.path().join("wp-content/plugins/fixture");
+    fs::create_dir_all(repository.join(".ddev-placeholder")).expect("repository directory");
+    assert!(
+        run_git(&repository, &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(&repository, &["config", "user.name", "Fixture User"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(
+            &repository,
+            &["config", "user.email", "fixture@example.test"]
+        )
+        .status
+        .success()
+    );
+    fs::write(repository.join(".gitignore"), ".worktrees/\n.ddev-site/\n").expect("ignore rules");
+    fs::write(repository.join("README.md"), "fixture\n").expect("fixture source");
+    fs::write(
+        repository.join(".ddev-workspaces.toml"),
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n\n[ddev.external_site]\nsource_root_env = 'FIXTURE_DDEV_SITE'\ngenerated_root_env = 'FIXTURE_DDEV_GENERATED_ROOT'\nrepository_path = 'wp-content/plugins/fixture'\nclone_database = true\n",
+    )
+    .expect("workspace configuration");
+    commit(&repository, "external site fixture");
+    fs::create_dir_all(site.path().join(".ddev")).expect("DDEV directory");
+    fs::write(site.path().join(".ddev/config.yaml"), "type: wordpress\n")
+        .expect("DDEV configuration");
+    fs::write(site.path().join("index.php"), "<?php // source site\n").expect("source site file");
+    fs::create_dir_all(site.path().join("wp-content/plugins/dependency/.git"))
+        .expect("dependency metadata");
+    fs::create_dir_all(
+        site.path()
+            .join("wp-content/plugins/dependency/node_modules"),
+    )
+    .expect("dependency node modules");
+    fs::write(
+        site.path().join("wp-content/plugins/dependency/plugin.php"),
+        "<?php // dependency\n",
+    )
+    .expect("dependency plugin");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        "plugin.php",
+        site.path()
+            .join("wp-content/plugins/dependency/plugin-link.php"),
+    )
+    .expect("safe relative dependency symlink");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state directory");
+    let generated_sites = tempfile::tempdir().expect("generated DDEV sites");
+    let generated_root = generated_sites.path().join("new/generated-root");
+    let state = fake_state.path().join("running");
+    let log = fake_state.path().join("calls.log");
+    let fake_bin = support::fake_ddev_directory(&state);
+    let variables = [
+        ("DDEV_FAKE_NAME", "dw-fixture--nested"),
+        ("DDEV_FAKE_LOG", log.to_str().expect("log path")),
+        (
+            "FIXTURE_DDEV_SITE",
+            site.path().to_str().expect("site path"),
+        ),
+        (
+            "FIXTURE_DDEV_GENERATED_ROOT",
+            generated_root.to_str().expect("generated site root"),
+        ),
+    ];
+    let output = run_cli_with_path_and_vars(
+        &repository,
+        &["create", "--base", "HEAD", "nested"],
+        fake_bin.path(),
+        &variables,
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+    assert!(output.status.success(), "{text}");
+    let workspace = repository.join(".worktrees/nested");
+    let generated_site = generated_root.join("fixture/nested");
+    let compose =
+        fs::read_to_string(generated_site.join(".ddev/docker-compose.ddev-workspaces.yaml"))
+            .expect("generated compose configuration");
+    let canonical_generated_site =
+        fs::canonicalize(&generated_site).expect("canonical generated site");
+
+    assert_eq!(
+        fs::read_to_string(generated_site.join("index.php")).expect("cloned site file"),
+        "<?php // source site\n"
+    );
+    assert!(
+        generated_site
+            .join("wp-content/plugins/dependency/plugin.php")
+            .is_file()
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(generated_site.join("wp-content/plugins/dependency/plugin-link.php"))
+            .expect("copied relative dependency symlink"),
+        PathBuf::from("plugin.php")
+    );
+    assert!(
+        !generated_site
+            .join("wp-content/plugins/dependency/.git")
+            .exists()
+    );
+    assert!(
+        !generated_site
+            .join("wp-content/plugins/dependency/node_modules")
+            .exists()
+    );
+    assert!(
+        !generated_site
+            .join("wp-content/plugins/fixture/README.md")
+            .exists()
+    );
+    assert_eq!(
+        compose
+            .lines()
+            .filter(|line| line.trim_start().starts_with('-'))
+            .count(),
+        1
+    );
+    assert!(compose.contains(&format!(
+        "{}:/var/www/html/wp-content/plugins/fixture",
+        workspace.display()
+    )));
+    let calls = fs::read_to_string(&log).expect("DDEV calls");
+    assert!(calls.lines().any(|line| line.starts_with("export-db ")));
+    assert!(calls.lines().any(|line| line.starts_with("import-db ")));
+
+    assert!(text.contains(&canonical_generated_site.display().to_string()));
+
+    let removal_preview = run_cli_with_path_and_vars(
+        &repository,
+        &["remove", "--dry-run", "nested"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(
+        removal_preview.status.success(),
+        "{}",
+        support::stderr(&removal_preview)
+    );
+    let preview_text = stdout(&removal_preview);
+    assert!(
+        preview_text.contains(&format!(
+            "Will recursively remove generated DDEV application {}.",
+            canonical_generated_site.display()
+        )),
+        "{preview_text}"
+    );
+
+    let removed = run_cli_with_path_and_vars(
+        &repository,
+        &["remove", "--confirm", "nested", "nested"],
+        fake_bin.path(),
+        &variables,
+    );
+    let removed_text = format!("{}{}", stdout(&removed), support::stderr(&removed));
+    assert!(removed.status.success(), "{removed_text}");
+    assert!(!workspace.exists());
+    assert!(!generated_site.exists());
+}
+
+#[test]
+fn external_source_only_creation_needs_no_ddev_environment() {
+    let (_site, repository) =
+        external_repository("SOURCE_ONLY_DDEV_SITE", "SOURCE_ONLY_GENERATED_ROOT");
+
+    let output = support::run_cli(
+        &repository,
+        &["create", "--source-only", "--base", "HEAD", "source-only"],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert!(output.status.success(), "{text}");
+    assert!(repository.join(".worktrees/source-only").is_dir());
+    assert!(text.contains("DDEV: skipped by --source-only"));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_creation_rejects_a_symlinked_source_ddev_directory_without_mutating_it() {
+    use std::os::unix::fs::symlink;
+
+    let (site, repository) = external_repository("SYMLINK_DDEV_SITE", "SYMLINK_GENERATED_ROOT");
+    let external_ddev = tempfile::tempdir().expect("external DDEV target");
+    fs::remove_dir_all(site.path().join(".ddev")).expect("remove regular DDEV directory");
+    fs::write(
+        external_ddev.path().join("config.yaml"),
+        "type: wordpress\n",
+    )
+    .expect("external DDEV config");
+    symlink(external_ddev.path(), site.path().join(".ddev")).expect("source DDEV symlink");
+    let generated = tempfile::tempdir().expect("generated root");
+    let fake_state = tempfile::tempdir().expect("fake DDEV state");
+    let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
+
+    let output = run_cli_with_path_and_vars(
+        &repository,
+        &["create", "--base", "HEAD", "unsafe"],
+        fake_bin.path(),
+        &[
+            (
+                "SYMLINK_DDEV_SITE",
+                site.path().to_str().expect("source site"),
+            ),
+            (
+                "SYMLINK_GENERATED_ROOT",
+                generated.path().to_str().expect("generated root"),
+            ),
+        ],
+    );
+    let text = format!("{}{}", stdout(&output), support::stderr(&output));
+
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("regular non-symlink .ddev directory"));
+    assert!(
+        !external_ddev
+            .path()
+            .join("docker-compose.ddev-workspaces.yaml")
+            .exists()
+    );
+}
+
+#[test]
+fn partial_external_creation_without_an_app_root_can_be_removed() {
+    let (site, repository) = external_repository("PARTIAL_DDEV_SITE", "PARTIAL_GENERATED_ROOT");
+    let generated = tempfile::tempdir().expect("generated root");
+    let created = support::run_cli(
+        &repository,
+        &["create", "--source-only", "--base", "HEAD", "partial"],
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    let record_path = repository.join(".git/ddev-workspaces/workspaces/partial.toml");
+    let app_root = fs::canonicalize(generated.path())
+        .expect("canonical generated root")
+        .join("fixture/partial");
+    let mut record = fs::read_to_string(&record_path).expect("ownership record");
+    record = record.replace("source_only = true", "source_only = false");
+    record = record.replace("external_ddev_site = false", "external_ddev_site = true");
+    record.push_str(&format!(
+        "ddev_app_root = {:?}\n",
+        app_root.display().to_string()
+    ));
+    fs::write(&record_path, record).expect("partial ownership record");
+
+    let fake_state = tempfile::tempdir().expect("fake DDEV state");
+    let fake_bin = support::fake_ddev_directory(&fake_state.path().join("running"));
+    let removed = run_cli_with_path_and_vars(
+        &repository,
+        &["remove", "--confirm", "partial", "partial"],
+        fake_bin.path(),
+        &[
+            (
+                "PARTIAL_DDEV_SITE",
+                site.path().to_str().expect("source site"),
+            ),
+            (
+                "PARTIAL_GENERATED_ROOT",
+                generated.path().to_str().expect("generated root"),
+            ),
+        ],
+    );
+    let text = format!("{}{}", stdout(&removed), support::stderr(&removed));
+
+    assert!(removed.status.success(), "{text}");
+    assert!(!repository.join(".worktrees/partial").exists());
+    assert!(!record_path.exists());
+}
+
+#[test]
+fn removal_refuses_external_mode_drift_without_orphaning_owned_state() {
+    let (site, repository) = external_repository("DRIFT_DDEV_SITE", "DRIFT_GENERATED_ROOT");
+    let generated = tempfile::tempdir().expect("generated root");
+    let generated_site = fs::canonicalize(generated.path())
+        .expect("canonical generated root")
+        .join("fixture/drift");
+    let fake_state = tempfile::tempdir().expect("fake DDEV state");
+    let state = fake_state.path().join("running");
+    let fake_bin = support::fake_ddev_directory(&state);
+    let variables = [
+        ("DDEV_FAKE_NAME", "dw-fixture--drift"),
+        (
+            "DRIFT_DDEV_SITE",
+            site.path().to_str().expect("source site"),
+        ),
+        (
+            "DRIFT_GENERATED_ROOT",
+            generated.path().to_str().expect("generated root"),
+        ),
+    ];
+    let created = run_cli_with_path_and_vars(
+        &repository,
+        &["create", "--base", "HEAD", "drift"],
+        fake_bin.path(),
+        &variables,
+    );
+    assert!(created.status.success(), "{}", support::stderr(&created));
+
+    fs::write(
+        repository.join(".ddev-workspaces.toml"),
+        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n\n[ddev]\napp_root = '.'\n",
+    )
+    .expect("plain DDEV configuration");
+    let removed = run_cli_with_path_and_vars(
+        &repository,
+        &["remove", "--confirm", "drift", "drift"],
+        fake_bin.path(),
+        &variables,
+    );
+    let text = format!("{}{}", stdout(&removed), support::stderr(&removed));
+    let record_path = repository.join(".git/ddev-workspaces/workspaces/drift.toml");
+
+    assert!(!removed.status.success(), "{text}");
+    assert!(text.contains("current DDEV mode differs from creation provenance"));
+    assert!(generated_site.exists());
+    assert!(repository.join(".worktrees/drift").exists());
+    assert!(record_path.exists());
+}
 
 #[test]
 fn doctor_does_not_let_ddev_prune_the_real_project_registry() {

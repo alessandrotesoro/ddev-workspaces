@@ -1,5 +1,8 @@
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -280,6 +283,7 @@ pub fn write_override<R: CommandRunner>(
     repo_root: &Path,
     app_root: &Path,
     expected_name: &str,
+    disable_mutagen: bool,
     runner: &mut R,
 ) -> ToolResult<PathBuf> {
     let ddev_directory = app_root.join(".ddev");
@@ -312,7 +316,9 @@ pub fn write_override<R: CommandRunner>(
             override_path.display()
         )));
     }
-    if !config::is_ignored(repo_root, &override_path, runner)? {
+    if override_path.starts_with(repo_root)
+        && !config::is_ignored(repo_root, &override_path, runner)?
+    {
         return Err(ToolError::new(format!(
             "DDEV override {} is not ignored by Git; add a local ignore rule manually",
             override_path.display()
@@ -329,7 +335,11 @@ pub fn write_override<R: CommandRunner>(
             ))
         })?;
     use std::io::Write;
-    file.write_all(format!("name: {expected_name}\n").as_bytes())
+    let mut contents = format!("name: {expected_name}\n");
+    if disable_mutagen {
+        contents.push_str("performance_mode: none\n");
+    }
+    file.write_all(contents.as_bytes())
         .and_then(|_| file.sync_all())
         .map_err(|error| {
             ToolError::new(format!(
@@ -338,6 +348,189 @@ pub fn write_override<R: CommandRunner>(
             ))
         })?;
     Ok(override_path)
+}
+
+pub fn prepare_external_site(
+    workspace: &Path,
+    app_root: &Path,
+    generated_root: &Path,
+    source_root: &Path,
+    repository_path: &str,
+) -> ToolResult<()> {
+    reserve_external_app_root(generated_root, app_root)?;
+    let excluded_repository = source_root.join(repository_path);
+    copy_external_site_tree(source_root, app_root, &excluded_repository, source_root)?;
+    let mounted_repository = app_root.join(repository_path);
+    fs::create_dir_all(&mounted_repository)?;
+    let ddev_directory = app_root.join(".ddev");
+    let repository = serde_json::to_string(&format!(
+        "{}:/var/www/html/{}",
+        workspace.display(),
+        repository_path
+    ))
+    .map_err(|error| ToolError::new(format!("cannot encode repository mount: {error}")))?;
+    let compose = format!("services:\n  web:\n    volumes:\n      - {repository}\n");
+    let compose_path = ddev_directory.join("docker-compose.ddev-workspaces.yaml");
+    let mut compose_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&compose_path)
+        .map_err(|error| {
+            ToolError::new(format!(
+                "cannot create owned DDEV compose file {}: {error}",
+                compose_path.display()
+            ))
+        })?;
+    compose_file.write_all(compose.as_bytes())?;
+    compose_file.sync_all()?;
+    Ok(())
+}
+
+fn reserve_external_app_root(generated_root: &Path, app_root: &Path) -> ToolResult<()> {
+    let generated_root = fs::canonicalize(generated_root)?;
+    let relative = app_root.strip_prefix(&generated_root).map_err(|_| {
+        ToolError::new(format!(
+            "external DDEV app root {} is outside generated root {}",
+            app_root.display(),
+            generated_root.display()
+        ))
+    })?;
+    let mut current = generated_root;
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(ToolError::new(
+                "external DDEV app root contains an unsafe component",
+            ));
+        };
+        current.push(part);
+        let is_app_root = index + 1 == components.len();
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && !is_app_root => {
+                let metadata = fs::symlink_metadata(&current)?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(ToolError::new(format!(
+                        "generated DDEV parent {} is not a regular directory",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ToolError::new(format!(
+                    "external DDEV app root {} already exists; refusing to overwrite it",
+                    app_root.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn copy_external_site_tree(
+    source: &Path,
+    destination: &Path,
+    excluded_repository: &Path,
+    source_root: &Path,
+) -> ToolResult<()> {
+    if source == excluded_repository {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(source)?;
+        let resolved_target = source
+            .parent()
+            .ok_or_else(|| ToolError::new("external DDEV symlink has no parent"))?
+            .join(&target);
+        let canonical_target = fs::canonicalize(&resolved_target).map_err(|error| {
+            ToolError::new(format!(
+                "external DDEV site symlink {} has an unavailable target: {error}",
+                source.display()
+            ))
+        })?;
+        if target.is_absolute()
+            || !canonical_target.starts_with(source_root)
+            || canonical_target.starts_with(excluded_repository)
+        {
+            return Err(ToolError::new(format!(
+                "external DDEV site contains symlink {}; refusing to copy a link that could escape the generated site",
+                source.display()
+            )));
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, destination)?;
+        #[cfg(not(unix))]
+        return Err(ToolError::new(format!(
+            "external DDEV site contains symlink {}, which is unsupported on this platform",
+            source.display()
+        )));
+        return Ok(());
+    }
+    if metadata.is_file() {
+        let mut input = fs::File::open(source)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        fs::set_permissions(destination, metadata.permissions())?;
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Err(ToolError::new(format!(
+            "external DDEV site contains unsupported entry {}",
+            source.display()
+        )));
+    }
+    if source != source_root {
+        fs::create_dir(destination)?;
+    }
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let child_source = entry.path();
+        if child_source == excluded_repository {
+            continue;
+        }
+        let name = child_source.file_name().and_then(|name| name.to_str());
+        let relative = child_source
+            .strip_prefix(source_root)
+            .unwrap_or(&child_source);
+        let in_ddev = relative.starts_with(".ddev");
+        if name.is_some_and(|name| {
+            matches!(
+                name,
+                ".git"
+                    | "node_modules"
+                    | "config.ddev-workspaces.yaml"
+                    | "config.ddev-workspaces-export.yaml"
+                    | "docker-compose.ddev-workspaces.yaml"
+            ) || (in_ddev
+                && matches!(
+                    name,
+                    ".ddev-docker-compose-base.yaml"
+                        | ".ddev-docker-compose-full.yaml"
+                        | ".dbimageBuild"
+                        | ".webimageBuild"
+                        | ".homeadditions"
+                        | ".start-synced"
+                        | "db_snapshots"
+                        | "traefik"
+                ))
+        }) {
+            continue;
+        }
+        copy_external_site_tree(
+            &child_source,
+            &destination.join(entry.file_name()),
+            excluded_repository,
+            source_root,
+        )?;
+    }
+    fs::set_permissions(destination, metadata.permissions())?;
+    Ok(())
 }
 
 pub fn start<R: CommandRunner>(app_root: &Path, runner: &mut R) -> ToolResult<()> {
@@ -352,6 +545,229 @@ pub fn start<R: CommandRunner>(app_root: &Path, runner: &mut R) -> ToolResult<()
             "DDEV start failed for {}; preserve the owned workspace and inspect DDEV manually",
             app_root.display()
         )))
+    }
+}
+
+struct DatabaseDump {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl DatabaseDump {
+    fn create() -> ToolResult<Self> {
+        let temp_root = std::env::temp_dir();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ToolError::new(format!("system clock is unavailable: {error}")))?
+            .as_nanos();
+        for attempt in 0..32u8 {
+            let directory = temp_root.join(format!(
+                "ddev-workspaces-database-{}-{nonce}-{attempt}",
+                std::process::id()
+            ));
+            let result = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = fs::DirBuilder::new();
+                    builder.mode(0o700).create(&directory)
+                }
+                #[cfg(not(unix))]
+                {
+                    fs::create_dir(&directory)
+                }
+            };
+            match result {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: directory.join("database.sql.gz"),
+                        directory,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(ToolError::new(
+            "could not reserve a private temporary directory for the database clone",
+        ))
+    }
+}
+
+struct SourceMutagenOverride {
+    path: PathBuf,
+}
+
+impl SourceMutagenOverride {
+    fn create(source_root: &Path) -> ToolResult<Self> {
+        let path = source_root
+            .join(".ddev")
+            .join("config.ddev-workspaces-export.yaml");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                ToolError::new(format!(
+                    "cannot create temporary source DDEV override {}: {error}",
+                    path.display()
+                ))
+            })?;
+        let override_file = Self { path };
+        use std::io::Write;
+        file.write_all(b"performance_mode: none\n")
+            .and_then(|_| file.sync_all())?;
+        Ok(override_file)
+    }
+}
+
+impl Drop for SourceMutagenOverride {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for DatabaseDump {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[cfg(unix)]
+struct InterruptGuard {
+    interrupted: Arc<AtomicBool>,
+    registrations: Vec<signal_hook::SigId>,
+}
+
+#[cfg(unix)]
+impl InterruptGuard {
+    fn create() -> ToolResult<Self> {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let registrations = [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM]
+            .into_iter()
+            .map(|signal| signal_hook::flag::register(signal, Arc::clone(&interrupted)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                ToolError::new(format!("cannot install cleanup signal handler: {error}"))
+            })?;
+        Ok(Self {
+            interrupted,
+            registrations,
+        })
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct InterruptGuard;
+
+#[cfg(not(unix))]
+impl InterruptGuard {
+    fn create() -> ToolResult<Self> {
+        Ok(Self)
+    }
+
+    fn interrupted(&self) -> bool {
+        false
+    }
+}
+
+pub fn clone_database<R: CommandRunner>(
+    source_root: &Path,
+    target_root: &Path,
+    runner: &mut R,
+) -> ToolResult<()> {
+    let interrupt_guard = InterruptGuard::create()?;
+    let source_was_running = list(runner, source_root)?.entries.iter().any(|project| {
+        canonical_or_raw(Path::new(&project.approot)) == canonical_or_raw(source_root)
+            && project.status.eq_ignore_ascii_case("running")
+    });
+    let _source_override = if source_was_running {
+        None
+    } else {
+        Some(SourceMutagenOverride::create(source_root)?)
+    };
+    let dump = DatabaseDump::create()?;
+    let clone_result = (|| {
+        let export = CommandRequest::new(
+            "ddev",
+            [
+                "export-db".to_owned(),
+                format!("--file={}", dump.path.display()),
+            ],
+        )
+        .cwd(source_root)
+        .mutating();
+        if !runner.run(&export)?.success() {
+            return Err(ToolError::new(format!(
+                "could not export the external DDEV database from {}",
+                source_root.display()
+            )));
+        }
+        let import = CommandRequest::new(
+            "ddev",
+            [
+                "import-db".to_owned(),
+                "--no-progress".to_owned(),
+                format!("--file={}", dump.path.display()),
+            ],
+        )
+        .cwd(target_root)
+        .mutating();
+        let output = runner.run(&import)?;
+        if !output.success() {
+            let detail = format!("{}{}", output.stdout, output.stderr);
+            let detail = detail.trim();
+            return Err(ToolError::new(format!(
+                "could not import the external DDEV database into {}{}",
+                target_root.display(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )));
+        }
+        Ok(())
+    })();
+    let restore_result = if source_was_running {
+        Ok(())
+    } else {
+        let stop = CommandRequest::new("ddev", ["stop"])
+            .cwd(source_root)
+            .mutating();
+        if runner.run(&stop)?.success() {
+            Ok(())
+        } else {
+            Err(ToolError::new(format!(
+                "external DDEV database was cloned, but {} could not be restored to its stopped state",
+                source_root.display()
+            )))
+        }
+    };
+    let interrupted = interrupt_guard.interrupted();
+    match (clone_result, restore_result, interrupted) {
+        (Err(clone_error), Err(restore_error), _) => Err(ToolError::new(format!(
+            "{clone_error}; additionally, source-state restoration failed: {restore_error}"
+        ))),
+        (_, Err(restore_error), _) => Err(restore_error),
+        (Err(clone_error), Ok(()), _) => Err(clone_error),
+        (Ok(()), Ok(()), true) => Err(ToolError::new(
+            "database cloning was interrupted after source-state cleanup completed",
+        )),
+        (Ok(()), Ok(()), false) => Ok(()),
     }
 }
 
@@ -694,10 +1110,28 @@ mod tests {
         let app = repository.path().join("app");
         fs::create_dir(&app).expect("app root");
         let mut runner = FakeRunner::default();
-        assert!(write_override(repository.path(), &app, "dw-fixture--task", &mut runner).is_err());
+        assert!(
+            write_override(
+                repository.path(),
+                &app,
+                "dw-fixture--task",
+                false,
+                &mut runner
+            )
+            .is_err()
+        );
 
         fs::create_dir(app.join(".ddev")).expect("DDEV directory");
-        assert!(write_override(repository.path(), &app, "dw-fixture--task", &mut runner).is_err());
+        assert!(
+            write_override(
+                repository.path(),
+                &app,
+                "dw-fixture--task",
+                false,
+                &mut runner
+            )
+            .is_err()
+        );
 
         fs::write(app.join(".ddev/config.yaml"), "type: php\n").expect("DDEV config");
         runner.responses.push(CommandOutput {
@@ -705,14 +1139,28 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
         });
-        let override_path =
-            write_override(repository.path(), &app, "dw-fixture--task", &mut runner)
-                .expect("ignored override should be created");
+        let override_path = write_override(
+            repository.path(),
+            &app,
+            "dw-fixture--task",
+            false,
+            &mut runner,
+        )
+        .expect("ignored override should be created");
         assert_eq!(
             fs::read_to_string(&override_path).expect("override contents"),
             "name: dw-fixture--task\n"
         );
-        assert!(write_override(repository.path(), &app, "dw-fixture--task", &mut runner).is_err());
+        assert!(
+            write_override(
+                repository.path(),
+                &app,
+                "dw-fixture--task",
+                false,
+                &mut runner
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -738,5 +1186,198 @@ mod tests {
             .is_err()
         );
         assert!(runner.requests.iter().all(|request| request.mutating));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_site_copy_rejects_symlinks_before_owned_files_are_written() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempdir().expect("fixture");
+        let source = fixture.path().join("source");
+        let generated = fixture.path().join("generated");
+        let external_ddev = fixture.path().join("source-ddev");
+        fs::create_dir_all(&source).expect("source");
+        fs::create_dir(&generated).expect("generated root");
+        let generated = fs::canonicalize(generated).expect("canonical generated root");
+        let app_root = generated.join("fixture/task");
+        fs::create_dir(&external_ddev).expect("external DDEV directory");
+        fs::write(external_ddev.join("config.yaml"), "type: wordpress\n").expect("DDEV config");
+        symlink(&external_ddev, source.join(".ddev")).expect("source DDEV symlink");
+
+        let error = prepare_external_site(
+            fixture.path(),
+            &app_root,
+            &generated,
+            &source,
+            "wp-content/plugins/fixture",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("contains symlink"), "{error}");
+        assert!(
+            !external_ddev
+                .join("docker-compose.ddev-workspaces.yaml")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn external_site_reserves_the_app_root_exclusively() {
+        let fixture = tempdir().expect("fixture");
+        let source = fixture.path().join("source");
+        let generated = fixture.path().join("generated");
+        fs::create_dir_all(source.join(".ddev")).expect("source DDEV directory");
+        fs::write(source.join(".ddev/config.yaml"), "type: wordpress\n").expect("DDEV config");
+        fs::create_dir(&generated).expect("generated root");
+        let generated = fs::canonicalize(generated).expect("canonical generated root");
+        let app_root = generated.join("fixture/task");
+        fs::create_dir_all(&app_root).expect("occupied app root");
+
+        let error = prepare_external_site(
+            fixture.path(),
+            &app_root,
+            &generated,
+            &source,
+            "wp-content/plugins/fixture",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"), "{error}");
+    }
+
+    #[test]
+    fn database_clone_reports_clone_and_restoration_failures_and_cleans_private_dump() {
+        let fixture = tempdir().expect("fixture");
+        let source = fixture.path().join("source");
+        let target = fixture.path().join("target");
+        let global = fixture.path().join("global");
+        fs::create_dir_all(source.join(".ddev")).expect("source DDEV directory");
+        fs::create_dir(&target).expect("target");
+        fs::create_dir(&global).expect("global");
+        let failed = CommandOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let mut runner = FakeRunner {
+            requests: Vec::new(),
+            responses: vec![
+                failed.clone(),
+                failed,
+                CommandOutput {
+                    status: 0,
+                    stdout: "{\"raw\":[]}".to_owned(),
+                    stderr: String::new(),
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: format!(
+                        "{{\"raw\":{{\"global-ddev-dir\":\"{}\"}}}}",
+                        global.display()
+                    ),
+                    stderr: String::new(),
+                },
+            ],
+        };
+
+        let error = clone_database(&source, &target, &mut runner).unwrap_err();
+        let export = runner
+            .requests
+            .iter()
+            .find(|request| request.args.first().is_some_and(|arg| arg == "export-db"))
+            .expect("export request");
+        let dump = export
+            .args
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--file="))
+            .map(PathBuf::from)
+            .expect("database dump path");
+
+        assert!(error.to_string().contains("could not export"));
+        assert!(
+            error
+                .to_string()
+                .contains("source-state restoration failed")
+        );
+        assert!(!dump.parent().expect("private dump directory").exists());
+        assert!(
+            !source
+                .join(".ddev/config.ddev-workspaces-export.yaml")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_clone_restores_a_stopped_source_after_an_interrupt() {
+        struct InterruptingRunner {
+            global: PathBuf,
+            requests: Vec<CommandRequest>,
+        }
+
+        impl CommandRunner for InterruptingRunner {
+            fn run(&mut self, request: &CommandRequest) -> ToolResult<CommandOutput> {
+                self.requests.push(request.clone());
+                let command = request.args.first().map(String::as_str);
+                match command {
+                    Some("version") => Ok(CommandOutput {
+                        status: 0,
+                        stdout: format!(
+                            "{{\"raw\":{{\"global-ddev-dir\":\"{}\"}}}}",
+                            self.global.display()
+                        ),
+                        stderr: String::new(),
+                    }),
+                    Some("list") => Ok(CommandOutput {
+                        status: 0,
+                        stdout: "{\"raw\":[]}".to_owned(),
+                        stderr: String::new(),
+                    }),
+                    Some("export-db") => {
+                        signal_hook::low_level::raise(signal_hook::consts::SIGINT)
+                            .expect("raise SIGINT");
+                        Ok(CommandOutput {
+                            status: 1,
+                            stdout: String::new(),
+                            stderr: "interrupted".to_owned(),
+                        })
+                    }
+                    Some("stop") => Ok(CommandOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }),
+                    _ => unreachable!("unexpected DDEV request"),
+                }
+            }
+        }
+
+        let fixture = tempdir().expect("fixture");
+        let source = fixture.path().join("source");
+        let target = fixture.path().join("target");
+        let global = fixture.path().join("global");
+        fs::create_dir_all(source.join(".ddev")).expect("source DDEV directory");
+        fs::create_dir(&target).expect("target");
+        fs::create_dir(&global).expect("global");
+        let mut runner = InterruptingRunner {
+            global,
+            requests: Vec::new(),
+        };
+
+        let error = clone_database(&source, &target, &mut runner).unwrap_err();
+
+        assert!(error.to_string().contains("could not export"));
+        assert!(
+            runner
+                .requests
+                .iter()
+                .any(|request| request.args.first().is_some_and(|arg| arg == "stop"))
+        );
+        assert!(
+            !source
+                .join(".ddev/config.ddev-workspaces-export.yaml")
+                .exists()
+        );
     }
 }
