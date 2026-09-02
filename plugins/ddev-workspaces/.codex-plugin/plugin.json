@@ -1,0 +1,28 @@
+{
+  "name": "ddev-workspaces",
+  "version": "0.1.0",
+  "description": "Teach coding agents to create and manage isolated Git and DDEV workspaces safely.",
+  "author": {
+    "name": "Alessandro Tesoro",
+    "url": "https://github.com/alessandrotesoro"
+  },
+  "homepage": "https://github.com/alessandrotesoro/ddev-workspaces",
+  "repository": "https://github.com/alessandrotesoro/ddev-workspaces",
+  "license": "MIT",
+  "keywords": ["ddev", "git", "worktree", "cli"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DDEV Workspaces",
+    "shortDescription": "Safely manage isolated Git and DDEV workspaces.",
+    "longDescription": "Configure repositories and safely create, diagnose, list, and remove workspaces with the ddev-workspaces CLI.",
+    "developerName": "Alessandro Tesoro",
+    "category": "DeveloperTools",
+    "capabilities": ["Local workflows", "Git worktrees", "DDEV"],
+    "websiteURL": "https://github.com/alessandrotesoro/ddev-workspaces",
+    "defaultPrompt": [
+      "Set up this repository for ddev-workspaces.",
+      "Create an isolated workspace for my next task.",
+      "Diagnose my managed DDEV workspaces."
+    ]
+  }
+}
