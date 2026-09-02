@@ -91,11 +91,11 @@ From the repository's main worktree:
    ddev-workspaces list
    ```
 
-4. Preview removal, then confirm the exact workspace name:
+4. Preview removal, then confirm the prompt:
 
    ```sh
    ddev-workspaces remove --dry-run feature-name
-   ddev-workspaces remove --confirm feature-name feature-name
+   ddev-workspaces remove feature-name
    ```
 
 > [!IMPORTANT]
@@ -201,7 +201,7 @@ codex plugin add ddev-workspaces@ddev-workspaces
 | `doctor [PATH]` | Diagnose a repository or managed workspace without modifying it. |
 | `create [--base REV] [--source-only] [--dry-run] NAME` | Create an isolated managed workspace. |
 | `list` | List managed workspaces and recompute readiness. |
-| `remove [--dry-run] [--delete-ddev-data] [--confirm NAME] [--confirm-data NAME] NAME` | Remove a proven workspace while retaining its branch. |
+| `remove [--dry-run] [--delete-ddev-data] [--yes] NAME` | Remove a proven workspace while retaining its branch. |
 
 Exit code `0` means ready or complete, `1` means not ready, and `2` indicates invalid command usage.
 
@@ -212,7 +212,7 @@ Exit code `0` means ready or complete, `1` means not ready, and `2` indicates in
 - Symlink escapes, unmanaged paths, dirty worktrees, invalid records, and mismatched DDEV identities are rejected.
 - Prepared files are never overwritten and generated destinations must be ignored by Git.
 - Normal removal retains the branch and DDEV data.
-- DDEV data deletion requires `--delete-ddev-data` and a second exact confirmation.
+- DDEV data deletion requires `--delete-ddev-data` and confirmation through the prompt or `--yes`.
 
 > [!WARNING]
 > A failed creation can intentionally retain its ownership record, branch, and worktree for diagnosis. Run `ddev-workspaces doctor PATH`, correct the reported problem, then retry or remove the workspace through the CLI.
@@ -247,10 +247,10 @@ Run `ddev-workspaces doctor PATH` with the path from the failure report. Fix the
 <details>
 <summary><strong>Removal requires confirmation</strong></summary>
 
-Pass the exact workspace name to both the option and positional argument:
+Run the command in a terminal and answer its single prompt. In scripts or other non-interactive environments, pass `--yes`:
 
 ```sh
-ddev-workspaces remove --confirm feature-name feature-name
+ddev-workspaces remove --yes feature-name
 ```
 
 </details>

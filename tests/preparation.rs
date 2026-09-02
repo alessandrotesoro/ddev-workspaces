@@ -148,10 +148,7 @@ fn ignored_command_outputs_remain_ready_and_removable() {
     assert!(listed.status.success(), "{listed_text}");
     assert!(listed_text.contains("ignored-command: READY"));
 
-    let removed = run_cli(
-        repository.path(),
-        &["remove", "--confirm", "ignored-command", "ignored-command"],
-    );
+    let removed = run_cli(repository.path(), &["remove", "--yes", "ignored-command"]);
     let removed_text = format!("{}{}", stdout(&removed), support::stderr(&removed));
     assert!(removed.status.success(), "{removed_text}");
 }

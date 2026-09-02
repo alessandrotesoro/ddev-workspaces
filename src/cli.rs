@@ -53,17 +53,10 @@ pub fn build_cli() -> Command {
                         .help("Also request DDEV's snapshot-by-default data removal"),
                 )
                 .arg(
-                    Arg::new("confirm")
-                        .long("confirm")
-                        .value_name("NAME")
-                        .help("Confirm the exact workspace name for removal"),
-                )
-                .arg(
-                    Arg::new("confirm-data")
-                        .long("confirm-data")
-                        .value_name("NAME")
-                        .requires("delete-ddev-data")
-                        .help("Second exact confirmation required when deleting DDEV data"),
+                    Arg::new("yes")
+                        .long("yes")
+                        .action(ArgAction::SetTrue)
+                        .help("Skip the interactive removal confirmation"),
                 )
                 .arg(Arg::new("name").value_name("NAME").required(true).index(1)),
         )

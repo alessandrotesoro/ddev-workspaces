@@ -131,7 +131,7 @@ jobs:
           (
             cd "$fixture"
             "$binary" remove --dry-run ci-lifecycle
-            "$binary" remove --confirm ci-lifecycle ci-lifecycle
+            "$binary" remove --yes ci-lifecycle
           )
           test ! -e "$workspace"
           test ! -e "$fixture/.git/ddev-workspaces/workspaces/ci-lifecycle.toml"

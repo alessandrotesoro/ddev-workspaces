@@ -100,21 +100,27 @@ A failed creation may intentionally leave an ownership record, branch, and workt
 
 ## Remove a workspace
 
-Removal is destructive and requires clear user intent. Inspect the owned target and preview removal before confirming the exact name:
+Removal is destructive and requires clear user intent. Inspect the owned target and preview removal before answering the single confirmation prompt:
 
 ```sh
 ddev-workspaces list
 ddev-workspaces remove --dry-run <name>
-ddev-workspaces remove --confirm <name> <name>
+ddev-workspaces remove <name>
 ```
 
-Normal removal retains the Git branch and DDEV data. Delete DDEV data only when the user explicitly requests it, using both confirmations:
+Normal removal retains the Git branch and DDEV data. Delete DDEV data only when the user explicitly requests it:
 
 For source-site workspaces, normal removal also recursively deletes the exact generated DDEV application directory printed by the dry run. It does not delete the source site.
 
 ```sh
-ddev-workspaces remove --delete-ddev-data \
-  --confirm <name> --confirm-data <name> <name>
+ddev-workspaces remove --delete-ddev-data <name>
+```
+
+In a non-interactive environment, add `--yes` only after the user has authorized the removal:
+
+```sh
+ddev-workspaces remove --yes <name>
+ddev-workspaces remove --delete-ddev-data --yes <name>
 ```
 
 Never force removal, manually erase the ownership record, or prune Git worktree metadata to get around a refusal. Report the blocking diagnostic and ask for direction when it cannot be resolved safely.

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::ArgMatches;
@@ -754,10 +754,7 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
     config::validate_name("workspace name", name)?;
     let dry_run = arguments.get_flag("dry-run");
     let delete_data = arguments.get_flag("delete-ddev-data");
-    let confirmation = arguments.get_one::<String>("confirm").map(String::as_str);
-    let data_confirmation = arguments
-        .get_one::<String>("confirm-data")
-        .map(String::as_str);
+    let yes = arguments.get_flag("yes");
     let mut runner = RealCommandRunner::new(false);
     let repository = GitRepository::discover(Path::new("."), &mut runner)?;
     let manager_root = repository.main_worktree.clone();
@@ -790,9 +787,6 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
         }
     }
     println!("Will retain branch {}.", record.branch);
-    if delete_data {
-        println!("DDEV data deletion requires a second exact confirmation.");
-    }
     if delete_data && target.ddev.is_none() {
         return Err(ToolError::new(
             "--delete-ddev-data was requested but the exact owned DDEV identity is absent",
@@ -804,10 +798,7 @@ fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
         return Ok(0);
     }
 
-    require_confirmation(name, confirmation, "removal")?;
-    if delete_data {
-        require_confirmation(name, data_confirmation, "DDEV data deletion")?;
-    }
+    require_removal_confirmation(name, delete_data, yes)?;
 
     let (_, current_config, current_record) = reload_removal_state(
         &repository,
@@ -1519,36 +1510,91 @@ fn preserved_failure(error: ToolError, workspace: &Path, record_path: &Path) -> 
     ))
 }
 
-fn require_confirmation(name: &str, provided: Option<&str>, purpose: &str) -> ToolResult<()> {
-    if let Some(provided) = provided {
-        if provided == name {
-            return Ok(());
-        }
-        return Err(ToolError::new(format!(
-            "{purpose} confirmation did not exactly match workspace name `{name}`; no mutation was attempted"
-        )));
+fn require_removal_confirmation(name: &str, delete_data: bool, yes: bool) -> ToolResult<()> {
+    if yes {
+        return Ok(());
     }
     if !io::stdin().is_terminal() {
-        return Err(ToolError::new(format!(
-            "non-interactive {purpose} requires `--confirm {name}`; no mutation was attempted"
-        )));
+        return Err(ToolError::new(
+            "non-interactive removal requires `--yes`; no mutation was attempted",
+        ));
     }
-    print!("Type {name} to confirm {purpose}: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    if input.trim() == name {
+
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    prompt_for_removal(name, delete_data, &mut input, &mut output)
+}
+
+fn prompt_for_removal(
+    name: &str,
+    delete_data: bool,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> ToolResult<()> {
+    if delete_data {
+        write!(
+            output,
+            "Remove workspace `{name}` and permanently delete its DDEV data? [y/N]: "
+        )?;
+    } else {
+        write!(output, "Remove workspace `{name}`? [y/N]: ")?;
+    }
+    output.flush()?;
+
+    let mut response = String::new();
+    input.read_line(&mut response)?;
+    if response.trim().eq_ignore_ascii_case("y") || response.trim().eq_ignore_ascii_case("yes") {
         Ok(())
     } else {
-        Err(ToolError::new(format!(
-            "{purpose} confirmation did not exactly match workspace name `{name}`; no mutation was attempted"
-        )))
+        Err(ToolError::new(
+            "removal cancelled; no mutation was attempted",
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
+
+    #[test]
+    fn prompt_for_removal_accepts_yes() {
+        let mut input = Cursor::new("yes\n");
+        let mut output = Vec::new();
+
+        let result = prompt_for_removal("feature", false, &mut input, &mut output);
+
+        assert!(result.is_ok(), "confirmation failed: {result:?}");
+    }
+
+    #[test]
+    fn prompt_for_removal_warns_before_deleting_ddev_data() {
+        let mut input = Cursor::new("y\n");
+        let mut output = Vec::new();
+
+        prompt_for_removal("feature", true, &mut input, &mut output)
+            .expect("confirmation should succeed");
+
+        let prompt = String::from_utf8(output).expect("UTF-8 prompt");
+        assert!(prompt.contains("permanently delete its DDEV data"));
+    }
+
+    #[test]
+    fn prompt_for_removal_rejects_no() {
+        let mut input = Cursor::new("no\n");
+        let mut output = Vec::new();
+
+        let error = prompt_for_removal("feature", false, &mut input, &mut output)
+            .expect_err("confirmation should be cancelled");
+
+        assert_eq!(
+            error.to_string(),
+            "removal cancelled; no mutation was attempted"
+        );
+    }
 
     #[test]
     fn env_key_check_does_not_return_or_print_the_value() {
