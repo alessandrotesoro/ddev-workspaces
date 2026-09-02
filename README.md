@@ -54,7 +54,7 @@ npm install --global @sematico/ddev-workspaces
 
 ```sh
 cargo install --git https://github.com/alessandrotesoro/ddev-workspaces \
-  --tag v0.1.0 \
+  --tag v0.2.0 \
   --locked
 ```
 

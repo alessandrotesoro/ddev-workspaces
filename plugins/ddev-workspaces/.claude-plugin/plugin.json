@@ -1,6 +1,6 @@
 {
   "name": "ddev-workspaces",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Teach coding agents to create and manage isolated Git and DDEV workspaces safely.",
   "author": {
     "name": "Alessandro Tesoro",

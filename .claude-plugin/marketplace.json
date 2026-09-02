@@ -10,7 +10,7 @@
       "name": "ddev-workspaces",
       "source": "./plugins/ddev-workspaces",
       "description": "Safely manage isolated Git and DDEV workspaces.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "category": "Development",
       "tags": ["ddev", "git", "worktree", "cli"]
     }
