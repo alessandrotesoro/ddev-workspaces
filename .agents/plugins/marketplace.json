@@ -1,0 +1,20 @@
+{
+  "name": "ddev-workspaces",
+  "interface": {
+    "displayName": "DDEV Workspaces"
+  },
+  "plugins": [
+    {
+      "name": "ddev-workspaces",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ddev-workspaces"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "DeveloperTools"
+    }
+  ]
+}

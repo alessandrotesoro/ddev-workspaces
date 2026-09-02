@@ -1,0 +1,18 @@
+{
+  "name": "ddev-workspaces",
+  "owner": {
+    "name": "Alessandro Tesoro",
+    "url": "https://github.com/alessandrotesoro"
+  },
+  "description": "Agent tooling for the ddev-workspaces CLI.",
+  "plugins": [
+    {
+      "name": "ddev-workspaces",
+      "source": "./plugins/ddev-workspaces",
+      "description": "Safely manage isolated Git and DDEV workspaces.",
+      "version": "0.1.0",
+      "category": "Development",
+      "tags": ["ddev", "git", "worktree", "cli"]
+    }
+  ]
+}
