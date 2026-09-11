@@ -3,6 +3,7 @@ mod command;
 mod config;
 mod ddev;
 mod git;
+mod runtime;
 mod state;
 mod workspace;
 

@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -7,62 +6,92 @@ use serde::Deserialize;
 use crate::command::{CommandRequest, CommandRunner, ToolError, ToolResult};
 
 pub const CONFIG_FILE: &str = ".ddev-workspaces.toml";
+pub const CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub version: u32,
     pub project_id: String,
-    pub workspace_root: String,
+    pub worktree_root: String,
+    pub runtime: RuntimeConfig,
     #[serde(default)]
-    pub ddev: Option<DdevConfig>,
+    pub database: DatabaseConfig,
     #[serde(default)]
-    pub files: Vec<FileRule>,
+    pub environment: Option<EnvironmentConfig>,
     #[serde(default)]
-    pub commands: Vec<CommandRule>,
+    pub carry: Vec<CarryRule>,
+    #[serde(default)]
+    pub provision: Vec<ProvisionRule>,
     #[serde(default)]
     pub checks: Vec<CheckRule>,
+    #[serde(default)]
+    pub writable: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct DdevConfig {
-    pub app_root: String,
+pub struct RuntimeConfig {
+    pub adapter: String,
+    pub host: String,
     #[serde(default)]
-    pub source_site: Option<SourceSiteConfig>,
+    pub docroot: Option<String>,
+    #[serde(default)]
+    pub component_kind: Option<String>,
+    #[serde(default)]
+    pub component_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SourceSiteConfig {
-    pub repository_path: String,
+pub struct DatabaseConfig {
+    #[serde(default = "default_database_mode")]
+    pub default: String,
     #[serde(default)]
-    pub clone_database: bool,
+    pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedSourceSite {
-    pub source_root: PathBuf,
-    pub generated_root: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FileRule {
-    pub label: String,
-    pub destination: String,
-    #[serde(default)]
-    pub template: Option<String>,
-    #[serde(default)]
-    pub source_env: Option<String>,
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            default: default_database_mode(),
+            source: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CommandRule {
-    pub label: String,
-    pub cwd: String,
+pub struct EnvironmentConfig {
+    pub source: String,
+    #[serde(default)]
+    pub destination: Option<String>,
+    #[serde(default)]
+    pub replace: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CarryRule {
+    pub source: String,
+    #[serde(default)]
+    pub destination: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionRule {
+    #[serde(default)]
+    pub label: Option<String>,
     pub argv: Vec<String>,
+    #[serde(default = "default_command_cwd")]
+    pub cwd: String,
+    #[serde(default = "default_provision_moment")]
+    pub when: String,
     #[serde(default)]
     pub sensitive: bool,
 }
@@ -70,11 +99,19 @@ pub struct CommandRule {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CheckRule {
-    pub label: String,
+    #[serde(default)]
+    pub label: Option<String>,
     pub kind: String,
     pub path: String,
     #[serde(default)]
     pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePaths {
+    pub repository_root: PathBuf,
+    pub host_root: PathBuf,
+    pub worktree_root: PathBuf,
 }
 
 impl ProjectConfig {
@@ -82,292 +119,574 @@ impl ProjectConfig {
         let path = repo_root.join(CONFIG_FILE);
         let contents = fs::read_to_string(&path).map_err(|error| {
             ToolError::new(format!(
-                "configuration is required at {}: {error}; add version, project_id, and workspace_root",
+                "configuration is required at {}: {error}; add version = 2, project_id, worktree_root, and runtime",
                 path.display()
             ))
         })?;
-        let config = toml::from_str::<Self>(&contents).map_err(|error| {
+        toml::from_str::<Self>(&contents).map_err(|error| {
             ToolError::new(format!(
-                "invalid configuration at {}: {error}; correct the named field and rerun doctor",
+                "invalid configuration at {}: {error}; use the version 2 schema and rerun doctor",
                 path.display()
             ))
-        })?;
-        Ok(config)
+        })
     }
 
-    pub fn validate<R: CommandRunner>(&self, repo_root: &Path, runner: &mut R) -> ToolResult<()> {
-        self.validate_structure(repo_root, runner)?;
-        if let Some(source_site) = self
-            .ddev
-            .as_ref()
-            .and_then(|ddev| ddev.source_site.as_ref())
-        {
-            resolve_source_site(repo_root, source_site, false)?;
-        }
-        Ok(())
+    pub fn validate<R: CommandRunner>(
+        &self,
+        repo_root: &Path,
+        runner: &mut R,
+    ) -> ToolResult<RuntimePaths> {
+        self.validate_structure(repo_root, runner)
     }
 
     pub fn validate_structure<R: CommandRunner>(
         &self,
         repo_root: &Path,
         runner: &mut R,
-    ) -> ToolResult<()> {
-        if self.version != 1 {
+    ) -> ToolResult<RuntimePaths> {
+        if self.version != CONFIG_VERSION {
             return Err(ToolError::new(format!(
-                "configuration field `version` must be integer 1, found {}; update {}",
+                "configuration field `version` must be integer 2, found {}; only version 2 is accepted; update {}",
                 self.version, CONFIG_FILE
             )));
         }
-        validate_name("project_id", &self.project_id)?;
-        validate_repository_relative("workspace_root", &self.workspace_root)?;
-
-        let workspace_root = safe_join(repo_root, &self.workspace_root)?;
-        let ignore_probe = workspace_root.join(".ddev-workspaces-ignore-probe");
-        if !is_ignored(repo_root, &ignore_probe, runner)? {
-            return Err(ToolError::new(format!(
-                "configuration field `workspace_root` must already be ignored by Git: {}; add a local ignore rule manually",
-                workspace_root.display()
-            )));
-        }
-
-        if let Some(ddev) = &self.ddev {
-            validate_repository_relative("ddev.app_root", &ddev.app_root)?;
-            let app_root = safe_join(repo_root, &ddev.app_root)?;
-            if app_root.join(".ddev").is_symlink() {
-                return Err(ToolError::new(
-                    "configuration field `ddev.app_root` resolves through a symlinked .ddev directory",
-                ));
-            }
-            if let Some(source_site) = &ddev.source_site {
-                validate_repository_relative(
-                    "ddev.source_site.repository_path",
-                    &source_site.repository_path,
-                )?;
-            }
-        }
-
-        let mut destinations = Vec::new();
-        for file in &self.files {
-            if file.label.trim().is_empty() {
-                return Err(ToolError::new(
-                    "configuration field `files[].label` must not be empty",
-                ));
-            }
-            validate_workspace_relative("files[].destination", &file.destination)?;
-            let destination = normalize_relative_path(&file.destination);
-            if destination.as_os_str().is_empty()
-                || destinations.iter().any(|existing: &PathBuf| {
-                    existing == &destination
-                        || existing.starts_with(&destination)
-                        || destination.starts_with(existing)
-                })
-            {
-                return Err(ToolError::new(format!(
-                    "file rule `{}` conflicts with destination `{}`; file destinations must be distinct files",
-                    file.label, file.destination
-                )));
-            }
-            destinations.push(destination);
-            match (&file.template, &file.source_env) {
-                (Some(_), None) | (None, Some(_)) => {}
-                (Some(_), Some(_)) => {
-                    return Err(ToolError::new(format!(
-                        "file rule `{}` must set exactly one of `template` or `source_env`",
-                        file.label
-                    )));
-                }
-                (None, None) => {
-                    return Err(ToolError::new(format!(
-                        "file rule `{}` must set exactly one of `template` or `source_env`",
-                        file.label
-                    )));
-                }
-            }
-            if let Some(template) = &file.template {
-                validate_repository_relative("files[].template", template)?;
-            }
-            if let Some(source_env) = &file.source_env {
-                validate_environment_name(source_env)?;
-            }
-        }
-
-        for command in &self.commands {
-            if command.label.trim().is_empty() {
-                return Err(ToolError::new(
-                    "configuration field `commands[].label` must not be empty",
-                ));
-            }
-            validate_repository_relative("commands[].cwd", &command.cwd)?;
-            if command.argv.is_empty() || command.argv.iter().any(|argument| argument.is_empty()) {
-                return Err(ToolError::new(format!(
-                    "command `{}` must have a non-empty argv array",
-                    command.label
-                )));
-            }
-        }
-
-        for check in &self.checks {
-            if check.label.trim().is_empty() {
-                return Err(ToolError::new(
-                    "configuration field `checks[].label` must not be empty",
-                ));
-            }
-            validate_workspace_relative("checks[].path", &check.path)?;
-            match check.kind.as_str() {
-                "path-exists" if check.key.is_none() => {}
-                "env-key" if check.key.as_deref().is_some_and(|key| !key.is_empty()) => {
-                    validate_environment_name(check.key.as_deref().unwrap_or_default())?;
-                }
-                "path-exists" => {
-                    return Err(ToolError::new(format!(
-                        "check `{}` of kind `path-exists` cannot define `key`",
-                        check.label
-                    )));
-                }
-                "env-key" => {
-                    return Err(ToolError::new(format!(
-                        "check `{}` of kind `env-key` requires a non-empty `key`",
-                        check.label
-                    )));
-                }
-                _ => {
-                    return Err(ToolError::new(format!(
-                        "check `{}` has unsupported kind `{}`; use `path-exists` or `env-key`",
-                        check.label, check.kind
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-pub fn source_site_root(repo_root: &Path) -> ToolResult<PathBuf> {
-    let canonical_repo_root = fs::canonicalize(repo_root)?;
-    for ancestor in canonical_repo_root.ancestors().skip(1) {
-        let ddev_directory = ancestor.join(".ddev");
-        let ddev_metadata = match fs::symlink_metadata(&ddev_directory) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(ToolError::new(format!(
-                    "cannot inspect potential source DDEV site {}: {error}",
-                    ancestor.display()
-                )));
-            }
-        };
-        if !ddev_metadata.is_dir() || ddev_metadata.file_type().is_symlink() {
-            return Err(ToolError::new(format!(
-                "source DDEV site {} must contain a regular non-symlink .ddev directory",
-                ancestor.display()
-            )));
-        }
-        let config_path = ddev_directory.join("config.yaml");
-        let config_metadata = fs::symlink_metadata(&config_path).map_err(|error| {
+        let repository_root = fs::canonicalize(repo_root).map_err(|error| {
             ToolError::new(format!(
-                "source DDEV site root {} has no usable .ddev/config.yaml: {error}",
-                ancestor.display()
+                "cannot resolve repository root {}: {error}",
+                repo_root.display()
             ))
         })?;
-        if !config_metadata.is_file() || config_metadata.file_type().is_symlink() {
+        validate_name("project_id", &self.project_id)?;
+        let worktree_root = resolve_worktree_root(&repository_root, &self.worktree_root)?;
+        if worktree_root.starts_with(repository_root.join(".git")) {
+            return Err(ToolError::new(
+                "configuration field `worktree_root` must not be inside the Git metadata directory",
+            ));
+        }
+        if worktree_root.starts_with(&repository_root)
+            && !is_ignored(
+                &repository_root,
+                &worktree_root.join(".ddev-workspaces-ignore-probe"),
+                runner,
+            )?
+        {
             return Err(ToolError::new(format!(
-                "source DDEV site root {} must contain a regular non-symlink .ddev/config.yaml",
-                ancestor.display()
+                "configuration field `worktree_root` must already be ignored by Git: {}; add a local ignore rule manually",
+                worktree_root.display()
             )));
         }
-        return Ok(ancestor.to_path_buf());
-    }
-    Err(ToolError::new(format!(
-        "repository {} is not contained in a DDEV site; add a regular .ddev/config.yaml to a parent directory or remove ddev.source_site",
-        canonical_repo_root.display()
-    )))
-}
 
-pub fn source_generated_root() -> ToolResult<PathBuf> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| ToolError::new("home directory is unavailable; HOME must be absolute"))?;
-    let path = home.join(".ddev-workspaces/sites");
-    let existing = nearest_existing_parent(&path);
-    let canonical_existing = fs::canonicalize(&existing)?;
-    let remainder = path
-        .strip_prefix(&existing)
-        .map_err(|_| ToolError::new("cannot resolve the default generated DDEV root"))?;
-    Ok(canonical_existing.join(remainder))
-}
-
-pub fn resolve_source_site(
-    repo_root: &Path,
-    config: &SourceSiteConfig,
-    create_generated_root: bool,
-) -> ToolResult<ResolvedSourceSite> {
-    let source_root = source_site_root(repo_root)?;
-    let mut generated_root = source_generated_root()?;
-    if create_generated_root {
-        create_directory_tree(&generated_root)?;
-        generated_root = fs::canonicalize(&generated_root)?;
-    }
-    if generated_root.starts_with(&source_root) || source_root.starts_with(&generated_root) {
-        return Err(ToolError::new(format!(
-            "generated DDEV root {} must be outside source DDEV site {}",
-            generated_root.display(),
-            source_root.display()
-        )));
-    }
-    let declared_repository = safe_join(&source_root, &config.repository_path)?;
-    let canonical_repository = fs::canonicalize(&declared_repository).map_err(|error| {
-        ToolError::new(format!(
-            "source DDEV site repository path {} is unavailable: {error}",
-            declared_repository.display()
-        ))
-    })?;
-    let canonical_repo_root = fs::canonicalize(repo_root)?;
-    if canonical_repository != canonical_repo_root {
-        return Err(ToolError::new(format!(
-            "ddev.source_site.repository_path resolves to {}, not this repository {}; refusing an unproven mount",
-            canonical_repository.display(),
-            canonical_repo_root.display()
-        )));
-    }
-    Ok(ResolvedSourceSite {
-        source_root,
-        generated_root,
-    })
-}
-
-fn create_directory_tree(path: &Path) -> ToolResult<()> {
-    let existing = nearest_existing_parent(path);
-    let mut current = fs::canonicalize(&existing)?;
-    let remainder = path.strip_prefix(&existing).map_err(|_| {
-        ToolError::new(format!(
-            "cannot prepare generated DDEV root {}",
-            path.display()
-        ))
-    })?;
-    for component in remainder.components() {
-        let Component::Normal(part) = component else {
+        let host_root = resolve_host_root(&repository_root, &self.runtime.host)?;
+        ensure_ddev_config(&host_root)?;
+        if !repository_root.starts_with(&host_root) {
             return Err(ToolError::new(format!(
-                "generated DDEV root {} contains an unsupported path component",
-                path.display()
+                "runtime host {} does not contain repository {}; the host must be the application containing this repository",
+                host_root.display(),
+                repository_root.display()
             )));
-        };
-        current.push(part);
-        match fs::create_dir(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(&current)?;
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    return Err(ToolError::new(format!(
-                        "generated DDEV root component {} is not a regular directory",
-                        current.display()
-                    )));
+        }
+        if !worktree_root.starts_with(&host_root) {
+            return Err(ToolError::new(format!(
+                "configured worktree root {} is outside runtime host {}; shared routing requires the host-mounted path",
+                worktree_root.display(),
+                host_root.display()
+            )));
+        }
+        if worktree_root.starts_with(host_root.join(".git")) {
+            return Err(ToolError::new(
+                "configuration field `worktree_root` must not be inside the runtime host Git metadata directory",
+            ));
+        }
+
+        match self.runtime.adapter.as_str() {
+            "laravel" => {
+                if repository_root != host_root {
+                    return Err(ToolError::new(
+                        "runtime adapter `laravel` requires runtime.host to be the Laravel repository root",
+                    ));
+                }
+                let docroot = self.runtime.docroot.as_deref().unwrap_or(".");
+                validate_workspace_relative("runtime.docroot", docroot)?;
+                let _ = resolve_existing_or_future(&repository_root, docroot)?;
+                if self.runtime.component_kind.is_some() || self.runtime.component_path.is_some() {
+                    return Err(ToolError::new(
+                        "runtime.adapter `laravel` cannot define component kind or component path",
+                    ));
                 }
             }
-            Err(error) => return Err(error.into()),
+            "wordpress-component" => {
+                if self.runtime.docroot.is_some() {
+                    return Err(ToolError::new(
+                        "runtime.adapter `wordpress-component` uses component_kind and component_path instead of docroot",
+                    ));
+                }
+                let kind = self.runtime.component_kind.as_deref().ok_or_else(|| {
+                    ToolError::new(
+                        "runtime.adapter `wordpress-component` requires runtime.component_kind = `plugin` or `theme`",
+                    )
+                })?;
+                if !matches!(kind, "plugin" | "theme") {
+                    return Err(ToolError::new(
+                        "runtime.component_kind must be exactly `plugin` or `theme`",
+                    ));
+                }
+                let component_path = self.runtime.component_path.as_deref().ok_or_else(|| {
+                    ToolError::new(
+                        "runtime.adapter `wordpress-component` requires a parent-relative runtime.component_path",
+                    )
+                })?;
+                validate_workspace_relative("runtime.component_path", component_path)?;
+                let component = safe_join(&host_root, component_path)?;
+                let canonical_component = fs::canonicalize(&component).map_err(|error| {
+                    ToolError::new(format!(
+                        "runtime.component_path {} is unavailable in host {}: {error}",
+                        component_path,
+                        host_root.display()
+                    ))
+                })?;
+                if canonical_component != repository_root {
+                    return Err(ToolError::new(format!(
+                        "runtime.component_path resolves to {}, not this component repository {}",
+                        canonical_component.display(),
+                        repository_root.display()
+                    )));
+                }
+                let expected_parent = if kind == "plugin" {
+                    "plugins"
+                } else {
+                    "themes"
+                };
+                let normalized_component_path = normalize_relative_path(component_path);
+                let components = normalized_component_path
+                    .components()
+                    .filter_map(|component| match component {
+                        Component::Normal(part) => part.to_str(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if components.len() < 3
+                    || components[0] != "wp-content"
+                    || components[1] != expected_parent
+                    || components[components.len() - 2] != expected_parent
+                {
+                    return Err(ToolError::new(format!(
+                        "runtime.component_path must be below wp-content/{expected_parent} for a {kind} workspace",
+                    )));
+                }
+                if self.environment.is_some() || !self.carry.is_empty() || !self.writable.is_empty()
+                {
+                    return Err(ToolError::new(
+                        "runtime.adapter `wordpress-component` does not accept environment, carry, or writable rules; use the generated wp-config and adapter-owned wp-content paths",
+                    ));
+                }
+            }
+            adapter => {
+                return Err(ToolError::new(format!(
+                    "runtime.adapter `{adapter}` is unsupported; use `laravel` or `wordpress-component`",
+                )));
+            }
+        }
+
+        validate_database(&self.database)?;
+        validate_generated_destinations(self)?;
+        validate_environment(self, &repository_root, runner)?;
+        validate_carry(self, &repository_root, runner)?;
+        validate_provision(self)?;
+        validate_checks(self)?;
+        validate_writable(self)?;
+
+        Ok(RuntimePaths {
+            repository_root,
+            host_root,
+            worktree_root,
+        })
+    }
+
+    pub fn database_mode(&self) -> ToolResult<DatabaseMode> {
+        match self.database.default.as_str() {
+            "copy" => Ok(DatabaseMode::Copy),
+            "fresh" => Ok(DatabaseMode::Fresh),
+            value => Err(ToolError::new(format!(
+                "database.default `{value}` is unsupported; use `copy` or `fresh`",
+            ))),
+        }
+    }
+
+    pub fn environment_source(
+        &self,
+        paths: &RuntimePaths,
+    ) -> ToolResult<Option<(PathBuf, PathBuf)>> {
+        let Some(environment) = &self.environment else {
+            return Ok(None);
+        };
+        let source = resolve_configured_source(&paths.repository_root, &environment.source)?;
+        let destination = environment
+            .destination
+            .as_deref()
+            .unwrap_or(&environment.source);
+        validate_workspace_relative("environment.destination", destination)?;
+        reject_directory_destination("environment.destination", destination)?;
+        Ok(Some((source, normalize_relative_path(destination))))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseMode {
+    Copy,
+    Fresh,
+}
+
+fn default_database_mode() -> String {
+    "copy".to_owned()
+}
+
+fn default_command_cwd() -> String {
+    ".".to_owned()
+}
+
+fn default_provision_moment() -> String {
+    "always".to_owned()
+}
+
+fn validate_database(database: &DatabaseConfig) -> ToolResult<()> {
+    if !matches!(database.default.as_str(), "copy" | "fresh") {
+        return Err(ToolError::new(format!(
+            "database.default `{}` is unsupported; use `copy` or `fresh`",
+            database.default
+        )));
+    }
+    if let Some(source) = &database.source {
+        validate_database_name("database.source", source)?;
+    }
+    Ok(())
+}
+
+fn validate_generated_destinations(config: &ProjectConfig) -> ToolResult<()> {
+    if config.runtime.adapter != "laravel" {
+        return Ok(());
+    }
+    let docroot = normalize_relative_path(config.runtime.docroot.as_deref().unwrap_or("."));
+    let is_public = |destination: &str| {
+        let destination = normalize_relative_path(destination);
+        destination == docroot || destination.starts_with(&docroot)
+    };
+    if let Some(environment) = &config.environment {
+        let destination = environment
+            .destination
+            .as_deref()
+            .unwrap_or(&environment.source);
+        if is_public(destination) {
+            return Err(ToolError::new(format!(
+                "generated environment destination `{destination}` would be inside Laravel runtime.docroot; keep generated environment state outside the public docroot"
+            )));
+        }
+    }
+    for carry in &config.carry {
+        if !carry.sensitive {
+            continue;
+        }
+        let destination = carry.destination.as_deref().unwrap_or(&carry.source);
+        if is_public(destination) {
+            return Err(ToolError::new(format!(
+                "sensitive carry destination `{destination}` would be inside Laravel runtime.docroot; keep sensitive generated state outside the public docroot"
+            )));
         }
     }
     Ok(())
+}
+
+fn validate_environment<R: CommandRunner>(
+    config: &ProjectConfig,
+    repository_root: &Path,
+    runner: &mut R,
+) -> ToolResult<()> {
+    let Some(environment) = &config.environment else {
+        return Ok(());
+    };
+    validate_repository_relative("environment.source", &environment.source)?;
+    let source = resolve_configured_source(repository_root, &environment.source)?;
+    ensure_regular_file(&source, "environment source")?;
+    let destination = environment
+        .destination
+        .as_deref()
+        .unwrap_or(&environment.source);
+    validate_workspace_relative("environment.destination", destination)?;
+    reject_directory_destination("environment.destination", destination)?;
+    let destination = normalize_relative_path(destination);
+    if !is_ignored(repository_root, &repository_root.join(&destination), runner)? {
+        return Err(ToolError::new(format!(
+            "environment destination `{}` must already be ignored by Git because it contains generated workspace state",
+            destination.display()
+        )));
+    }
+    let mut replacements = Vec::new();
+    for key in &environment.replace {
+        validate_environment_name(key)?;
+        if !matches!(
+            key.as_str(),
+            "APP_URL" | "DB_DATABASE" | "DB_HOST" | "DB_USERNAME" | "DB_PASSWORD"
+        ) {
+            return Err(ToolError::new(format!(
+                "environment.replace key `{key}` is not workspace-owned; use APP_URL or the supported DB_* keys",
+            )));
+        }
+        if replacements
+            .iter()
+            .any(|existing: &&String| existing.as_str() == key.as_str())
+        {
+            return Err(ToolError::new(format!(
+                "environment.replace contains duplicate key `{key}`",
+            )));
+        }
+        replacements.push(key);
+    }
+    if config.runtime.adapter == "laravel"
+        && !replacements.iter().any(|key| key.as_str() == "DB_DATABASE")
+    {
+        return Err(ToolError::new(
+            "Laravel environment.replace must include DB_DATABASE so a workspace cannot use the source database",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_carry<R: CommandRunner>(
+    config: &ProjectConfig,
+    repository_root: &Path,
+    runner: &mut R,
+) -> ToolResult<()> {
+    let mut destinations = Vec::new();
+    for carry in &config.carry {
+        validate_repository_relative("carry.source", &carry.source)?;
+        let source = resolve_configured_source(repository_root, &carry.source)?;
+        if carry.required {
+            ensure_regular_file(&source, "required carry source")?;
+        } else if source.exists() {
+            ensure_regular_file(&source, "carry source")?;
+        }
+        let destination = carry.destination.as_deref().unwrap_or(&carry.source);
+        validate_workspace_relative("carry.destination", destination)?;
+        let destination = normalize_relative_path(destination);
+        reject_directory_destination("carry.destination", &destination.display().to_string())?;
+        if carry.sensitive
+            && !is_ignored(repository_root, &repository_root.join(&destination), runner)?
+        {
+            return Err(ToolError::new(format!(
+                "sensitive carry destination `{}` must already be ignored by Git",
+                destination.display()
+            )));
+        }
+        if destinations.iter().any(|existing: &PathBuf| {
+            existing == &destination
+                || existing.starts_with(&destination)
+                || destination.starts_with(existing)
+        }) {
+            return Err(ToolError::new(format!(
+                "carry destination `{}` overlaps another carried path",
+                destination.display()
+            )));
+        }
+        destinations.push(destination);
+    }
+    Ok(())
+}
+
+fn validate_provision(config: &ProjectConfig) -> ToolResult<()> {
+    for provision in &config.provision {
+        if provision
+            .label
+            .as_deref()
+            .is_some_and(|label| label.trim().is_empty())
+        {
+            return Err(ToolError::new(
+                "provision.label must not be empty when provided",
+            ));
+        }
+        if provision.argv.is_empty() || provision.argv.iter().any(String::is_empty) {
+            return Err(ToolError::new(
+                "each provision rule must have a non-empty argv array",
+            ));
+        }
+        validate_repository_relative("provision.cwd", &provision.cwd)?;
+        if !matches!(provision.when.as_str(), "always" | "copy" | "fresh") {
+            return Err(ToolError::new(format!(
+                "provision rule `{}` has unsupported when `{}`; use `always`, `copy`, or `fresh`",
+                provision_label(provision),
+                provision.when
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_checks(config: &ProjectConfig) -> ToolResult<()> {
+    for check in &config.checks {
+        if check
+            .label
+            .as_deref()
+            .is_some_and(|label| label.trim().is_empty())
+        {
+            return Err(ToolError::new(
+                "check.label must not be empty when provided",
+            ));
+        }
+        validate_workspace_relative("check.path", &check.path)?;
+        match check.kind.as_str() {
+            "path-exists" if check.key.is_none() => {}
+            "env-key" if check.key.as_deref().is_some_and(|key| !key.is_empty()) => {
+                validate_environment_name(check.key.as_deref().unwrap_or_default())?;
+            }
+            "path-exists" => {
+                return Err(ToolError::new(format!(
+                    "check `{}` of kind `path-exists` cannot define key",
+                    check_label(check)
+                )));
+            }
+            "env-key" => {
+                return Err(ToolError::new(format!(
+                    "check `{}` of kind `env-key` requires a non-empty key",
+                    check_label(check)
+                )));
+            }
+            kind => {
+                return Err(ToolError::new(format!(
+                    "check `{}` has unsupported kind `{kind}`; use `path-exists` or `env-key`",
+                    check_label(check)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_writable(config: &ProjectConfig) -> ToolResult<()> {
+    let mut paths = Vec::new();
+    for path in &config.writable {
+        validate_workspace_relative("writable", path)?;
+        reject_directory_destination("writable", path)?;
+        let normalized = normalize_relative_path(path);
+        if paths.iter().any(|existing: &PathBuf| {
+            existing == &normalized
+                || existing.starts_with(&normalized)
+                || normalized.starts_with(existing)
+        }) {
+            return Err(ToolError::new(format!(
+                "writable path `{}` overlaps another writable path",
+                normalized.display()
+            )));
+        }
+        paths.push(normalized);
+    }
+    Ok(())
+}
+
+fn reject_directory_destination(field: &str, value: &str) -> ToolResult<()> {
+    if normalize_relative_path(value).as_os_str().is_empty() {
+        return Err(ToolError::new(format!(
+            "configuration field `{field}` must name a file or directory below the workspace root",
+        )));
+    }
+    Ok(())
+}
+
+fn provision_label(rule: &ProvisionRule) -> String {
+    rule.label.clone().unwrap_or_else(|| rule.argv.join(" "))
+}
+
+fn check_label(check: &CheckRule) -> String {
+    check.label.clone().unwrap_or_else(|| check.path.clone())
+}
+
+pub fn resolve_host_root(repo_root: &Path, value: &str) -> ToolResult<PathBuf> {
+    let path = Path::new(value);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    let canonical = fs::canonicalize(&candidate).map_err(|error| {
+        ToolError::new(format!(
+            "runtime.host {} is unavailable: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !canonical.is_dir() || canonical.join(".ddev").is_symlink() {
+        return Err(ToolError::new(format!(
+            "runtime.host {} must be a regular directory with a non-symlink .ddev directory",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn ensure_ddev_config(host_root: &Path) -> ToolResult<()> {
+    let directory = host_root.join(".ddev");
+    let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+        ToolError::new(format!(
+            "runtime host {} has no usable .ddev directory: {error}",
+            host_root.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ToolError::new(format!(
+            "runtime host {} must contain a regular .ddev directory",
+            host_root.display()
+        )));
+    }
+    let config = directory.join("config.yaml");
+    ensure_regular_file(&config, "DDEV configuration")
+}
+
+fn resolve_worktree_root(repo_root: &Path, value: &str) -> ToolResult<PathBuf> {
+    if value.is_empty() || Path::new(value).is_absolute() {
+        return Err(ToolError::new(
+            "configuration field `worktree_root` must be a non-empty relative path",
+        ));
+    }
+    let candidate = normalize_absolute_path(&repo_root.join(value));
+    let parent = nearest_existing_parent(&candidate);
+    let canonical_parent = fs::canonicalize(&parent).map_err(|error| {
+        ToolError::new(format!(
+            "cannot resolve worktree root parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if parent != canonical_parent {
+        return Err(ToolError::new(
+            "configuration field `worktree_root` resolves through a symlink; use a canonical path",
+        ));
+    }
+    let relative = candidate
+        .strip_prefix(&parent)
+        .map_err(|_| ToolError::new("cannot resolve worktree root"))?;
+    Ok(canonical_parent.join(normalize_relative_path(&relative.display().to_string())))
+}
+
+fn resolve_existing_or_future(root: &Path, relative: &str) -> ToolResult<PathBuf> {
+    let candidate = safe_join(root, relative)?;
+    let parent = nearest_existing_parent(&candidate);
+    let canonical_parent = fs::canonicalize(&parent).map_err(|error| {
+        ToolError::new(format!(
+            "cannot resolve path parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let canonical_root = fs::canonicalize(root)?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(ToolError::new(format!(
+            "path `{relative}` escapes its root through a symlink"
+        )));
+    }
+    Ok(candidate)
+}
+
+fn resolve_configured_source(root: &Path, value: &str) -> ToolResult<PathBuf> {
+    if Path::new(value).is_absolute() {
+        return Err(ToolError::new(format!(
+            "configured source path `{value}` must be repository-relative",
+        )));
+    }
+    safe_join(root, value)
 }
 
 pub fn validate_name(field: &str, value: &str) -> ToolResult<()> {
@@ -386,6 +705,47 @@ pub fn validate_name(field: &str, value: &str) -> ToolResult<()> {
     {
         return Err(ToolError::new(format!(
             "{field} `{value}` must match [a-z0-9](?:[a-z0-9-]*[a-z0-9])? and may not contain `--`"
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_workspace_name(value: &str) -> ToolResult<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.starts_with('-')
+        || value.ends_with('/')
+        || value.starts_with('/')
+        || value.contains("//")
+        || value.contains("..")
+        || value.contains("@{")
+        || value.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || byte.is_ascii_whitespace()
+                || !matches!(
+                    byte,
+                    b'a'..=b'z'
+                        | b'A'..=b'Z'
+                        | b'0'..=b'9'
+                        | b'-'
+                        | b'_'
+                        | b'.'
+                        | b'/'
+                )
+        })
+        || value.split('/').any(|component| {
+            component.is_empty()
+                || component.starts_with('.')
+                || component.ends_with('.')
+                || component.ends_with(".lock")
+                || component
+                    .bytes()
+                    .any(|byte| matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'))
+        })
+    {
+        return Err(ToolError::new(format!(
+            "workspace name `{value}` is not a safe Git branch name; use letters, digits, `/`, `.`, `_`, and `-`"
         )));
     }
     Ok(())
@@ -414,7 +774,7 @@ fn validate_relative(field: &str, value: &str) -> ToolResult<()> {
             Component::ParentDir if depth > 0 => depth -= 1,
             Component::ParentDir => {
                 return Err(ToolError::new(format!(
-                    "configuration field `{field}` escapes its repository/workspace root"
+                    "configuration field `{field}` escapes its root"
                 )));
             }
             Component::RootDir | Component::Prefix(_) => {
@@ -436,10 +796,7 @@ pub fn safe_join(root: &Path, relative: &str) -> ToolResult<PathBuf> {
     validate_repository_relative("path", relative)?;
     let candidate = root.join(normalize_relative_path(relative));
     let root_canonical = fs::canonicalize(root).map_err(|error| {
-        ToolError::new(format!(
-            "cannot resolve repository root {}: {error}",
-            root.display()
-        ))
+        ToolError::new(format!("cannot resolve root {}: {error}", root.display()))
     })?;
     let existing_parent = nearest_existing_parent(&candidate);
     let parent_canonical = fs::canonicalize(&existing_parent).map_err(|error| {
@@ -450,7 +807,7 @@ pub fn safe_join(root: &Path, relative: &str) -> ToolResult<PathBuf> {
     })?;
     if !parent_canonical.starts_with(&root_canonical) {
         return Err(ToolError::new(format!(
-            "path `{relative}` escapes repository root through a symlink"
+            "path `{relative}` escapes root through a symlink"
         )));
     }
     Ok(candidate)
@@ -466,6 +823,21 @@ pub fn normalize_relative_path(relative: &str) -> PathBuf {
                 normalized.pop();
             }
             Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    normalized
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                normalized.pop();
+            }
         }
     }
     normalized
@@ -509,7 +881,76 @@ pub fn is_ignored<R: CommandRunner>(
         ],
     );
     let output = runner.run(&request)?;
-    Ok(output.success())
+    match output.status {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(ToolError::new(format!(
+            "Git could not inspect whether {} is ignored",
+            path.display()
+        ))),
+    }
+}
+
+pub fn validate_database_name(field: &str, value: &str) -> ToolResult<()> {
+    if value.is_empty()
+        || value.len() > 60
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+    {
+        return Err(ToolError::new(format!(
+            "{field} `{value}` must be 1-60 lowercase database-safe characters"
+        )));
+    }
+    Ok(())
+}
+
+pub fn resource_key(project_id: &str, workspace_name: &str) -> String {
+    let project = normalize_identity_part(project_id);
+    let workspace = normalize_identity_part(workspace_name);
+    let raw = format!("{project}-{workspace}");
+    if raw.len() <= 52 {
+        return raw;
+    }
+    let suffix = stable_hash(&format!("{project_id}\0{workspace_name}"));
+    format!("{}-{suffix}", &raw[..52 - suffix.len() - 1])
+}
+
+pub fn identity_hash(project_id: &str, workspace_name: &str) -> String {
+    stable_hash(&format!("{project_id}\0{workspace_name}"))
+}
+
+fn normalize_identity_part(value: &str) -> String {
+    let mut output = String::new();
+    let mut separator = false;
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            if separator && !output.is_empty() {
+                output.push('-');
+            }
+            output.push(byte.to_ascii_lowercase() as char);
+            separator = false;
+        } else if !output.is_empty() {
+            separator = true;
+        }
+    }
+    while output.ends_with('-') {
+        output.pop();
+    }
+    if output.is_empty() {
+        "workspace".to_owned()
+    } else {
+        output
+    }
+}
+
+fn stable_hash(value: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:08x}")
 }
 
 fn validate_environment_name(value: &str) -> ToolResult<()> {
@@ -529,382 +970,22 @@ fn validate_environment_name(value: &str) -> ToolResult<()> {
     Ok(())
 }
 
-pub fn source_from_environment(name: &str) -> ToolResult<PathBuf> {
-    let value = env::var_os(name).ok_or_else(|| {
+fn ensure_regular_file(path: &Path, label: &str) -> ToolResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
         ToolError::new(format!(
-            "environment variable `{name}` is not set for the named file source; set it manually"
-        ))
-    })?;
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        return Err(ToolError::new(format!(
-            "environment variable `{name}` must contain an absolute local file path"
-        )));
-    }
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        ToolError::new(format!(
-            "named local file source `{name}` cannot be read: {error}"
+            "{label} {} is unavailable: {error}",
+            path.display()
         ))
     })?;
     if !metadata.file_type().is_file() {
         return Err(ToolError::new(format!(
-            "named local file source `{name}` must be a regular non-symlink file"
+            "{label} {} must be a regular non-symlink file",
+            path.display()
         )));
     }
-    Ok(path)
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::{CommandOutput, CommandRunner};
-    use std::cell::RefCell;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[derive(Default)]
-    struct IgnoreRunner {
-        ignored: bool,
-        requests: RefCell<Vec<CommandRequest>>,
-    }
-
-    impl CommandRunner for IgnoreRunner {
-        fn run(&mut self, request: &CommandRequest) -> ToolResult<CommandOutput> {
-            self.requests.get_mut().push(request.clone());
-            Ok(CommandOutput {
-                status: if self.ignored { 0 } else { 1 },
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        }
-    }
-
-    fn valid_config() -> ProjectConfig {
-        ProjectConfig {
-            version: 1,
-            project_id: "fixture".to_owned(),
-            workspace_root: ".worktrees".to_owned(),
-            ddev: None,
-            files: Vec::new(),
-            commands: Vec::new(),
-            checks: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn unknown_fields_are_rejected() {
-        let result = toml::from_str::<ProjectConfig>(
-            "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\nfuture = true\n",
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn future_versions_are_rejected_with_remediation() {
-        let directory = tempdir().expect("temporary directory");
-        let config = directory.path().join(CONFIG_FILE);
-        fs::write(
-            &config,
-            "version = 2\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n",
-        )
-        .expect("configuration should be written");
-        let loaded = ProjectConfig::load(directory.path()).expect("TOML should parse");
-        let mut runner = IgnoreRunner {
-            ignored: true,
-            ..Default::default()
-        };
-
-        let error = loaded.validate(directory.path(), &mut runner).unwrap_err();
-
-        assert!(error.to_string().contains("integer 1"));
-    }
-
-    #[test]
-    fn escaping_paths_are_rejected_before_git_ignore_is_checked() {
-        let mut config = valid_config();
-        config.workspace_root = "../outside".to_owned();
-        let directory = tempdir().expect("temporary directory");
-        let mut runner = IgnoreRunner {
-            ignored: true,
-            ..Default::default()
-        };
-
-        let error = config.validate(directory.path(), &mut runner).unwrap_err();
-
-        assert!(error.to_string().contains("escapes"));
-        assert!(runner.requests.borrow().is_empty());
-    }
-
-    #[test]
-    fn non_ignored_workspace_roots_are_rejected() {
-        let config = valid_config();
-        let directory = tempdir().expect("temporary directory");
-        fs::create_dir(directory.path().join(".worktrees")).expect("workspace root");
-        let mut runner = IgnoreRunner::default();
-
-        let error = config.validate(directory.path(), &mut runner).unwrap_err();
-
-        assert!(error.to_string().contains("ignored by Git"));
-    }
-
-    #[test]
-    fn exactly_one_file_source_is_required() {
-        let mut config = valid_config();
-        config.files.push(FileRule {
-            label: "environment".to_owned(),
-            destination: ".env".to_owned(),
-            template: Some(".env.example".to_owned()),
-            source_env: Some("LOCAL_ENV".to_owned()),
-        });
-        let directory = tempdir().expect("temporary directory");
-        let mut runner = IgnoreRunner {
-            ignored: true,
-            ..Default::default()
-        };
-
-        let error = config.validate(directory.path(), &mut runner).unwrap_err();
-
-        assert!(error.to_string().contains("exactly one"));
-    }
-
-    #[test]
-    fn duplicate_file_destinations_are_rejected() {
-        let mut config = valid_config();
-        config.files = vec![
-            FileRule {
-                label: "first".to_owned(),
-                destination: ".env".to_owned(),
-                template: Some("first.env".to_owned()),
-                source_env: None,
-            },
-            FileRule {
-                label: "second".to_owned(),
-                destination: ".env".to_owned(),
-                template: Some("second.env".to_owned()),
-                source_env: None,
-            },
-        ];
-        let directory = tempdir().expect("temporary directory");
-        let mut runner = IgnoreRunner {
-            ignored: true,
-            ..Default::default()
-        };
-
-        let error = config.validate(directory.path(), &mut runner).unwrap_err();
-
-        assert!(error.to_string().contains("distinct files"));
-    }
-
-    #[test]
-    fn dot_is_allowed_for_repository_relative_runtime_paths() {
-        assert!(validate_repository_relative("app_root", ".").is_ok());
-        assert!(validate_workspace_relative("check", ".").is_ok());
-    }
-
-    #[test]
-    fn missing_and_malformed_configuration_report_the_named_file() {
-        let directory = tempdir().expect("temporary directory");
-
-        let missing = ProjectConfig::load(directory.path()).unwrap_err();
-        fs::write(directory.path().join(CONFIG_FILE), "version = 'wrong'\n")
-            .expect("malformed configuration");
-        let malformed = ProjectConfig::load(directory.path()).unwrap_err();
-
-        assert!(missing.to_string().contains(CONFIG_FILE));
-        assert!(missing.to_string().contains("configuration is required"));
-        assert!(malformed.to_string().contains(CONFIG_FILE));
-        assert!(malformed.to_string().contains("invalid configuration"));
-    }
-
-    #[test]
-    fn names_and_relative_paths_enforce_the_documented_grammar() {
-        for invalid in [
-            "",
-            "Upper",
-            "-leading",
-            "trailing-",
-            "two--dashes",
-            "space here",
-        ] {
-            assert!(
-                validate_name("workspace name", invalid).is_err(),
-                "{invalid}"
-            );
-        }
-        for invalid in ["", "/absolute", "../escape", "a/../../escape", "a/.."] {
-            assert!(
-                validate_repository_relative("path", invalid).is_err(),
-                "{invalid}"
-            );
-        }
-        assert!(validate_name("workspace name", "task-42").is_ok());
-        assert!(validate_repository_relative("path", "a/../b").is_ok());
-    }
-
-    #[test]
-    fn file_command_and_check_rules_reject_invalid_public_configuration() {
-        let directory = tempdir().expect("temporary directory");
-        fs::create_dir(directory.path().join(".worktrees")).expect("workspace root");
-        let validate = |config: &ProjectConfig| {
-            config
-                .validate(
-                    directory.path(),
-                    &mut IgnoreRunner {
-                        ignored: true,
-                        ..Default::default()
-                    },
-                )
-                .unwrap_err()
-                .to_string()
-        };
-
-        let mut empty_file_label = valid_config();
-        empty_file_label.files.push(FileRule {
-            label: " ".to_owned(),
-            destination: ".env".to_owned(),
-            template: Some("example.env".to_owned()),
-            source_env: None,
-        });
-        assert!(validate(&empty_file_label).contains("files[].label"));
-
-        let mut missing_source = valid_config();
-        missing_source.files.push(FileRule {
-            label: "environment".to_owned(),
-            destination: ".env".to_owned(),
-            template: None,
-            source_env: None,
-        });
-        assert!(validate(&missing_source).contains("exactly one"));
-
-        let mut invalid_source_name = valid_config();
-        invalid_source_name.files.push(FileRule {
-            label: "environment".to_owned(),
-            destination: ".env".to_owned(),
-            template: None,
-            source_env: Some("1INVALID".to_owned()),
-        });
-        assert!(validate(&invalid_source_name).contains("variable name"));
-
-        let mut empty_command_label = valid_config();
-        empty_command_label.commands.push(CommandRule {
-            label: "".to_owned(),
-            cwd: ".".to_owned(),
-            argv: vec!["true".to_owned()],
-            sensitive: false,
-        });
-        assert!(validate(&empty_command_label).contains("commands[].label"));
-
-        let mut empty_argv = valid_config();
-        empty_argv.commands.push(CommandRule {
-            label: "setup".to_owned(),
-            cwd: ".".to_owned(),
-            argv: vec![String::new()],
-            sensitive: false,
-        });
-        assert!(validate(&empty_argv).contains("non-empty argv"));
-
-        for (kind, key, expected) in [
-            ("path-exists", Some("KEY"), "cannot define"),
-            ("env-key", None, "requires"),
-            ("future-kind", None, "unsupported"),
-        ] {
-            let mut invalid_check = valid_config();
-            invalid_check.checks.push(CheckRule {
-                label: "health".to_owned(),
-                kind: kind.to_owned(),
-                path: ".env".to_owned(),
-                key: key.map(str::to_owned),
-            });
-            assert!(validate(&invalid_check).contains(expected));
-        }
-
-        let mut valid = valid_config();
-        valid.files.push(FileRule {
-            label: "environment".to_owned(),
-            destination: ".env".to_owned(),
-            template: Some("example.env".to_owned()),
-            source_env: None,
-        });
-        valid.commands.push(CommandRule {
-            label: "setup".to_owned(),
-            cwd: ".".to_owned(),
-            argv: vec!["true".to_owned()],
-            sensitive: false,
-        });
-        valid.checks.push(CheckRule {
-            label: "environment".to_owned(),
-            kind: "env-key".to_owned(),
-            path: ".env".to_owned(),
-            key: Some("APP_KEY".to_owned()),
-        });
-        assert!(
-            valid
-                .validate(
-                    directory.path(),
-                    &mut IgnoreRunner {
-                        ignored: true,
-                        ..Default::default()
-                    }
-                )
-                .is_ok()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn safe_paths_reject_symlink_escape_and_symlinked_ddev_metadata() {
-        use std::os::unix::fs::symlink;
-
-        let repository = tempdir().expect("repository");
-        let outside = tempdir().expect("outside directory");
-        symlink(outside.path(), repository.path().join("linked")).expect("escape symlink");
-
-        let error = safe_join(repository.path(), "linked/file").unwrap_err();
-        assert!(error.to_string().contains("through a symlink"));
-        assert_eq!(
-            nearest_existing_parent(&repository.path().join("missing/child")),
-            repository.path()
-        );
-
-        fs::create_dir(repository.path().join(".worktrees")).expect("workspace root");
-        fs::create_dir(repository.path().join("app")).expect("app root");
-        symlink(outside.path(), repository.path().join("app/.ddev")).expect("DDEV symlink");
-        let mut config = valid_config();
-        config.ddev = Some(DdevConfig {
-            app_root: "app".to_owned(),
-            source_site: None,
-        });
-        let error = config
-            .validate(
-                repository.path(),
-                &mut IgnoreRunner {
-                    ignored: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("symlinked .ddev"));
-    }
-
-    #[test]
-    fn git_ignore_probe_is_repository_relative_and_outside_paths_are_rejected() {
-        let repository = tempdir().expect("repository");
-        let outside = tempdir().expect("outside directory");
-        let mut runner = IgnoreRunner {
-            ignored: true,
-            ..Default::default()
-        };
-
-        assert!(
-            is_ignored(
-                repository.path(),
-                &repository.path().join(".worktrees/probe"),
-                &mut runner
-            )
-            .expect("ignore probe")
-        );
-        assert_eq!(runner.requests.borrow()[0].program, "git");
-        assert!(is_ignored(repository.path(), outside.path(), &mut runner).is_err());
-    }
-}
+#[path = "config_tests.rs"]
+mod tests;

@@ -3,43 +3,50 @@ use clap::{Arg, ArgAction, Command};
 pub fn build_cli() -> Command {
     Command::new("ddev-workspaces")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Create and manage conservative local Git/DDEV workspaces")
+        .about("Create and manage shared-host Git/DDEV workspaces")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .disable_help_subcommand(true)
         .subcommand(
             Command::new("doctor")
-                .about("Diagnose a repository or managed workspace without changing it")
+                .about("Diagnose a repository, host, or managed workspace without changing it")
                 .arg(Arg::new("path").value_name("PATH").index(1)),
         )
         .subcommand(
-            Command::new("list").about("List managed workspaces for the current repository"),
+            Command::new("host")
+                .about("Manage the shared DDEV host integration")
+                .subcommand_required(true)
+                .subcommand(
+                    Command::new("init")
+                        .about("Install the owned wildcard route on the configured running host"),
+                ),
         )
+        .subcommand(Command::new("list").about("List managed workspaces for the shared host"))
         .subcommand(
             Command::new("create")
-                .about("Create an isolated workspace")
+                .about("Create an isolated workspace on the initialized shared host")
                 .arg(
                     Arg::new("base").long("base").value_name("REV").help(
                         "Use one locally resolvable commit instead of origin's advertised HEAD",
                     ),
                 )
                 .arg(
-                    Arg::new("source-only")
-                        .long("source-only")
+                    Arg::new("fresh")
+                        .long("fresh")
                         .action(ArgAction::SetTrue)
-                        .help("Stop after source readiness; skip runtime preparation and DDEV"),
+                        .help("Create an empty workspace database and run fresh provisioning"),
                 )
                 .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
                         .action(ArgAction::SetTrue)
-                        .help("Run safe preflight checks and print planned mutations"),
+                        .help("Run read-only checks and print planned mutations"),
                 )
                 .arg(Arg::new("name").value_name("NAME").required(true).index(1)),
         )
         .subcommand(
             Command::new("remove")
-                .about("Remove one proven managed workspace while retaining its branch")
+                .about("Remove one proven workspace while retaining its source branch")
                 .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
@@ -47,10 +54,10 @@ pub fn build_cli() -> Command {
                         .help("Run safety checks and print exact owned targets without mutation"),
                 )
                 .arg(
-                    Arg::new("delete-ddev-data")
-                        .long("delete-ddev-data")
+                    Arg::new("delete-database")
+                        .long("delete-database")
                         .action(ArgAction::SetTrue)
-                        .help("Also request DDEV's snapshot-by-default data removal"),
+                        .help("Explicitly delete an owned workspace database"),
                 )
                 .arg(
                     Arg::new("yes")

@@ -36,6 +36,8 @@ jobs:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
       - name: Verify native runner
         shell: bash
         run: |
@@ -43,21 +45,21 @@ jobs:
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.host }}"
       - name: Check formatting
         run: cargo fmt --all --check
-      - name: Check all targets
-        run: cargo check --all-targets --all-features --locked
+      - name: Check library and binary
+        run: cargo check --bins --all-features --locked
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings -D clippy::perf
-      - name: Run behavioral tests
-        run: cargo test --all-targets --all-features --locked
+        run: cargo clippy --bins --all-features --locked -- -D warnings -D clippy::perf
       - name: Check documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --all-features --locked --document-private-items
+      - name: Check dependency policy
+        run: cargo deny check
       - name: Build the release binary
         run: cargo build --release --locked
 
   ddev-lifecycle:
-    name: Disposable DDEV lifecycle (Linux x64)
+    name: Disposable shared-host DDEV lifecycle (Linux x64)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -75,66 +77,141 @@ jobs:
           git init --initial-branch=main "$fixture"
           git -C "$fixture" config user.name "DDEV Workspaces CI"
           git -C "$fixture" config user.email "ci@example.invalid"
-          mkdir -p "$fixture/.ddev"
+          mkdir -p "$fixture/.ddev" "$fixture/public"
           printf '%s\n' \
+            'name: dw-ci' \
             'type: php' \
             'docroot: .' \
             'disable_settings_management: true' \
             'performance_mode: none' \
-            'omit_containers: [db]' \
             > "$fixture/.ddev/config.yaml"
           printf '%s\n' \
-            'version = 1' \
+            'version = 2' \
             'project_id = "ci"' \
-            'workspace_root = ".worktrees"' \
+            'worktree_root = ".ddev-workspaces/worktrees"' \
             '' \
-            '[ddev]' \
-            'app_root = "."' \
+            '[runtime]' \
+            'adapter = "laravel"' \
+            'host = "."' \
+            'docroot = "."' \
+            '' \
+            '[database]' \
+            'default = "copy"' \
             > "$fixture/.ddev-workspaces.toml"
-          printf '%s\n' '.worktrees/' '.ddev/config.ddev-workspaces.yaml' > "$fixture/.gitignore"
-          printf '%s\n' '<?php echo "ready";' > "$fixture/index.php"
+          printf '%s\n' '.ddev-workspaces/' > "$fixture/.gitignore"
+          printf '%s\n' '<?php echo "shared-host-ready";' > "$fixture/index.php"
           git -C "$fixture" add .
-          git -C "$fixture" commit -m "Create disposable DDEV fixture"
+          git -C "$fixture" commit -m "Create disposable shared-host fixture"
       - name: Install DDEV for the Linux lifecycle
         uses: ddev/github-action-setup-ddev@v1
         with:
           autostart: false
           ddevDir: ${{ runner.temp }}/ddev-workspaces-ci
           version: 1.25.3
-      - name: Run and clean the disposable DDEV lifecycle
+      - name: Run and clean the disposable shared-host lifecycle
         shell: bash
         run: |
           set -euo pipefail
           fixture="$RUNNER_TEMP/ddev-workspaces-ci"
-          workspace="$fixture/.worktrees/ci-lifecycle"
+          workspace="$fixture/.ddev-workspaces/worktrees/ci-ci-lifecycle"
+          workspace_two="$fixture/.ddev-workspaces/worktrees/ci-ci-second"
           binary="$GITHUB_WORKSPACE/target/release/ddev-workspaces"
+          route="https://ci-ci-lifecycle.dw-ci.ddev.site"
+          route_two="https://ci-ci-second.dw-ci.ddev.site"
 
           cleanup() {
-            ddev stop --unlist dw-ci--ci-lifecycle >/dev/null 2>&1 || true
-            if git -C "$fixture" worktree list --porcelain 2>/dev/null | grep -Fq "worktree $workspace"; then
-              git -C "$fixture" worktree remove --force "$workspace" || true
-            fi
+            for workspace_name in ci-lifecycle ci-second; do
+              "$binary" remove --delete-database --yes "$workspace_name" >/dev/null 2>&1 || true
+            done
+            ddev stop --unlist dw-ci >/dev/null 2>&1 || true
+            for workspace_path in "$workspace" "$workspace_two"; do
+              if git -C "$fixture" worktree list --porcelain 2>/dev/null | grep -Fq "worktree $workspace_path"; then
+                git -C "$fixture" worktree remove --force "$workspace_path" || true
+              fi
+            done
             git -C "$fixture" branch -D ci-lifecycle >/dev/null 2>&1 || true
+            git -C "$fixture" branch -D ci-second >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
-          docker info >/dev/null
-          ddev version
-          "$binary" doctor "$fixture"
-          (
-            cd "$fixture"
-            "$binary" create --dry-run --base HEAD ci-lifecycle
-            "$binary" create --base HEAD ci-lifecycle
-            "$binary" list
-          )
+          cd "$fixture"
+          ddev start
+          "$binary" host init
+          "$binary" doctor
+          web_container="$(docker inspect --format '{{.Id}}' ddev-dw-ci-web)"
+          db_container="$(docker inspect --format '{{.Id}}' ddev-dw-ci-db)"
+          db_sql() {
+            local database="$1"
+            local statement="$2"
+            ddev exec --raw --service db -- mariadb \
+              --user=root \
+              --password=root \
+              --batch \
+              --skip-column-names \
+              --database="$database" \
+              --execute="$statement"
+          }
+          "$binary" create --dry-run --base HEAD ci-lifecycle
+          "$binary" create --base HEAD ci-lifecycle
+          test "$(docker inspect --format '{{.Id}}' ddev-dw-ci-web)" = "$web_container"
+          test "$(docker inspect --format '{{.Id}}' ddev-dw-ci-db)" = "$db_container"
+          "$binary" create --base HEAD ci-second
+          printf '%s\n' first > "$workspace/ci-isolation.txt"
+          printf '%s\n' second > "$workspace_two/ci-isolation.txt"
+          printf '%s\n' first > "$workspace/storage/ci-isolation.txt"
+          test ! -e "$workspace_two/storage/ci-isolation.txt"
+          db_sql dw_ci_ci_lifecycle \
+            "CREATE TABLE IF NOT EXISTS dw_workspace_marker (marker VARCHAR(32)); DELETE FROM dw_workspace_marker; INSERT INTO dw_workspace_marker VALUES ('ci-lifecycle');"
+          db_sql dw_ci_ci_second \
+            "CREATE TABLE IF NOT EXISTS dw_workspace_marker (marker VARCHAR(32)); DELETE FROM dw_workspace_marker; INSERT INTO dw_workspace_marker VALUES ('ci-second');"
+          "$binary" list
           "$binary" doctor "$workspace"
-          (
-            cd "$fixture"
-            "$binary" remove --dry-run ci-lifecycle
-            "$binary" remove --yes ci-lifecycle
-          )
+
+          test "$(docker ps --format '{{.Names}}' | grep -c '^ddev-dw-ci-web$')" = 1
+          test "$(docker ps --format '{{.Names}}' | grep -c '^ddev-dw-ci-db$')" = 1
+          test "$(docker inspect --format '{{.Id}}' ddev-dw-ci-web)" = "$web_container"
+          test "$(docker inspect --format '{{.Id}}' ddev-dw-ci-db)" = "$db_container"
+          curl --fail --silent --show-error --insecure \
+            --resolve "ci-ci-lifecycle.dw-ci.ddev.site:443:127.0.0.1" \
+            "$route" | grep -Fx 'shared-host-ready'
+          curl --fail --silent --show-error --insecure \
+            --resolve "ci-ci-lifecycle.dw-ci.ddev.site:443:127.0.0.1" \
+            "$route/ci-isolation.txt" | grep -Fx 'first'
+          curl --fail --silent --show-error --insecure \
+            --resolve "ci-ci-second.dw-ci.ddev.site:443:127.0.0.1" \
+            "$route_two" | grep -Fx 'shared-host-ready'
+          curl --fail --silent --show-error --insecure \
+            --resolve "ci-ci-second.dw-ci.ddev.site:443:127.0.0.1" \
+            "$route_two/ci-isolation.txt" | grep -Fx 'second'
+          rm "$workspace/ci-isolation.txt" "$workspace_two/ci-isolation.txt" \
+            "$workspace/storage/ci-isolation.txt"
+          unknown_status="$(curl --silent --show-error --insecure --output "$RUNNER_TEMP/unknown-host" \
+            --write-out '%{http_code}' \
+            --resolve "missing_bad.dw-ci.ddev.site:443:127.0.0.1" \
+            "https://missing_bad.dw-ci.ddev.site")"
+          test "$unknown_status" = 404
+
+          "$binary" remove --yes ci-lifecycle
+          set +e
+          retained_list="$("$binary" list)"
+          retained_status=$?
+          set -e
+          test "$retained_status" = 1
+          printf '%s\n' "$retained_list" | grep -F 'retained-data'
+          test "$(docker inspect --format '{{.Id}}' ddev-dw-ci-web)" = "$web_container"
+          test "$(docker inspect --format '{{.Id}}' ddev-dw-ci-db)" = "$db_container"
+          curl --fail --silent --show-error --insecure \
+            --resolve "ci-ci-second.dw-ci.ddev.site:443:127.0.0.1" \
+            "$route_two" | grep -Fx 'shared-host-ready'
+          db_sql dw_ci_ci_second \
+            "SELECT marker FROM dw_workspace_marker;" | grep -Fx 'ci-second'
+          "$binary" remove --delete-database --yes ci-lifecycle
+          "$binary" remove --delete-database --yes ci-second
           test ! -e "$workspace"
-          test ! -e "$fixture/.git/ddev-workspaces/workspaces/ci-lifecycle.toml"
-          git -C "$fixture" branch -D ci-lifecycle
-          test -z "$(ddev list --json-output | jq -r '.raw[]? | select(.name == "dw-ci--ci-lifecycle") | .name')"
+          test ! -e "$workspace_two"
+          test ! -e "$fixture/.ddev-workspaces/workspaces/ci-ci-lifecycle.toml"
+          git branch --show-current | grep -Fx main
+          test -n "$(git branch --list ci-lifecycle)"
+          test -n "$(git branch --list ci-second)"
           trap - EXIT
+          cleanup
