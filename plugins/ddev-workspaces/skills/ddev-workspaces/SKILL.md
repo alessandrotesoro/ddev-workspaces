@@ -1,20 +1,20 @@
 ---
 name: ddev-workspaces
-description: Create, inspect, diagnose, and safely remove local Git worktrees managed by the ddev-workspaces CLI. Use when a task calls for an isolated DDEV workspace or refers to .ddev-workspaces.toml, managed workspaces, or ddev-workspaces commands.
+description: Create, inspect, diagnose, and safely remove local Git worktrees managed by the ddev-workspaces CLI on a shared DDEV host. Use when a task calls for an isolated DDEV workspace or refers to .ddev-workspaces.toml, managed workspaces, or ddev-workspaces commands.
 ---
 
 # ddev-workspaces
 
-Use `ddev-workspaces` to manage isolated Git worktrees and their DDEV environments. Let the CLI enforce ownership and safety; do not replace its operations with raw `git worktree`, filesystem deletion, or manual DDEV cleanup.
+Use `ddev-workspaces` for isolated Git worktrees that share one existing DDEV application. Let the CLI enforce ownership and safety; do not replace its lifecycle with raw `git worktree`, filesystem deletion, or manual database cleanup.
 
 ## Before operating
 
-- Confirm `ddev-workspaces` is installed. If it is missing, direct the user to the project's installation instructions.
+- Confirm `ddev-workspaces` is installed. If it is missing, direct the user to the project installation instructions.
 - Work from the repository's main worktree unless diagnosing a specific managed workspace.
-- Read `.ddev-workspaces.toml` and confirm its declared `workspace_root` is ignored by Git.
-- Check whether the repository is nested inside a different DDEV project. If so, use `[ddev.source_site]`; the CLI discovers the nearest containing DDEV site and manages generated sites under `~/.ddev-workspaces/sites`.
-- Treat configuration `version = 1` as the configuration format, not the installed CLI version.
-- Use `ddev-workspaces <command> --help` for the installed version's exact flags.
+- Read `.ddev-workspaces.toml` and confirm its declared `worktree_root` is ignored by Git when it is inside the repository.
+- Confirm the configured `runtime.host` contains the repository and has a regular `.ddev/config.yaml`.
+- Treat `version = 2` as the configuration format. Unknown fields and older schemas are not compatible.
+- Use `ddev-workspaces <command> --help` for the installed binary's exact flags.
 
 Read-only inspection is safe while investigating:
 
@@ -23,70 +23,75 @@ ddev-workspaces doctor
 ddev-workspaces list
 ```
 
-Address safety, ownership, path, and runtime problems reported by `doctor` before creating or removing a workspace. An intentionally dirty manager configuration may be accepted only for a user-authorized temporary or dogfood workflow as described below; do not bypass any other diagnostic.
+Address safety, ownership, path, host identity, and routing problems reported by `doctor` before creating or removing a workspace. Do not bypass diagnostics or edit state records manually.
 
 ## Configure a repository
 
 When configuration is absent and the user wants the repository managed:
 
-1. Add the intended workspace directory, normally `.worktrees/`, to `.gitignore`.
-2. Create `.ddev-workspaces.toml` with a stable, DNS-safe `project_id` and repository-relative `workspace_root`.
-3. Add `[ddev]`, prepared files, commands, and readiness checks only when supported by the repository's actual setup. Never invent secret values or expose sensitive command output.
-4. Prefer committing the configuration and ignore rule on the appropriate branch so every agent sees the same durable setup. Never create that commit without user authorization. For an explicitly temporary or dogfood workflow, creation may proceed with intentional uncommitted configuration after warning the user that the configuration must remain unchanged until the workspace is removed.
-5. Run `ddev-workspaces doctor` to validate the result.
+1. Add `.ddev-workspaces/` or the configured worktree root to `.gitignore` when the path is inside the repository.
+2. Create `.ddev-workspaces.toml` with a stable DNS-safe `project_id`, `worktree_root`, and strict runtime adapter.
+3. Use `laravel` when the repository is the DDEV host root. Use `wordpress-component` when the repository is a plugin or theme nested in the host.
+4. Add only repository-specific environment, carry, provisioning, check, and writable rules. Never invent secrets or expose sensitive command output.
+5. Do not create a configuration commit without user authorization. For a temporary workflow, warn that the configuration and ignore rule must remain unchanged until the workspace is removed.
+6. Initialize the existing running host, then run `ddev-workspaces doctor`. Host initialization is the only lifecycle command that may restart DDEV, and only when the managed host assets change.
 
-Minimal configuration:
+Laravel example:
 
 ```toml
-version = 1
+version = 2
 project_id = "example-app"
-workspace_root = ".worktrees"
+worktree_root = ".ddev-workspaces/worktrees"
 
-[ddev]
-app_root = "."
+[runtime]
+adapter = "laravel"
+host = "."
+docroot = "public"
+
+[database]
+default = "copy"
 ```
 
-For a repository nested inside another DDEV site:
+Nested WordPress plugin example:
 
 ```toml
-version = 1
+version = 2
 project_id = "example-plugin"
-workspace_root = ".worktrees"
+worktree_root = "../../../.ddev-workspaces/worktrees"
 
-[ddev]
-app_root = "."
+[runtime]
+adapter = "wordpress-component"
+host = "../../../"
+component_kind = "plugin"
+component_path = "wp-content/plugins/example-plugin"
 
-[ddev.source_site]
-repository_path = "wp-content/plugins/example-plugin"
-clone_database = true
+[database]
+default = "copy"
 ```
 
-Confirm the repository is beneath a regular, non-symlink `.ddev/config.yaml` and that `repository_path` identifies it from that containing site. The CLI creates the managed generated root when necessary, rejects absolute or escaping source-tree symlinks, clones the site, mounts the worktree at `repository_path`, disables Mutagen for the generated project, and restores a source project that was initially stopped.
+The component path must resolve exactly to the repository and must be below `wp-content/plugins/` or `wp-content/themes/` according to `component_kind`. The CLI creates a mount-safe runtime view with relative links, an isolated writable content area, and an owned workspace `wp-config.php`.
 
-Consult the [project README](https://github.com/alessandrotesoro/ddev-workspaces#configuration) for the full configuration schema.
+Initialize the shared host once. This explicit command may briefly restart DDEV when it installs or updates the managed assets; ordinary create, list, doctor, and remove operations do not restart the host.
+
+```sh
+ddev start
+ddev-workspaces host init
+ddev-workspaces doctor
+```
 
 ## Create a workspace
 
 Preview creation before applying it:
 
 ```sh
-ddev-workspaces doctor
 ddev-workspaces create --dry-run <name>
 ddev-workspaces create <name>
 ddev-workspaces list
 ```
 
-Record the generated DDEV app root and deterministic project name printed by `create` or `list`. In source-site mode, the Git worktree is mounted inside that separate application but is not itself the DDEV app root. Run `ddev`, `ddev wp`, and other DDEV-backed commands from the generated app root reported by the CLI (or use an explicit DDEV project selector when the command supports one). Never run a bare DDEV command from the nested plugin worktree or source site: it may select the original source project instead.
+Each workspace uses a hostname below the configured host, for example `https://<resource-key>.<host>.ddev.site`, while the DDEV web and database container identities remain those of the shared host. Do not start a second DDEV project for a workspace.
 
-Creation without `--base` uses the exact commit advertised by `origin`'s symbolic `HEAD`; it does not fetch. If that commit is missing, fetch the branch named by the error and repeat the dry run. Use `--base <revision>` only when the user or task requires a different locally resolvable base.
-
-Use `--source-only` only when the task needs a Git worktree without file preparation, configured commands, readiness checks, or DDEV:
-
-```sh
-ddev-workspaces create --source-only <name>
-```
-
-For a plugin repository nested inside an existing WordPress/DDEV site, prefer source-site mode when the task needs a working WordPress runtime. Use source-only creation only when the task intentionally does not need the plugin mounted or a DDEV site.
+Creation without `--base` uses the exact commit advertised by the local `origin` symbolic `HEAD`; it does not fetch. Use `--base <revision>` only when the user or task requires a different locally resolvable base. Use `--fresh` when the workspace must start with an empty database.
 
 ## Diagnose a workspace
 
@@ -96,11 +101,11 @@ Use the path reported by the CLI:
 ddev-workspaces doctor <path>
 ```
 
-A failed creation may intentionally leave an ownership record, branch, and worktree for diagnosis. Fix the reported source, preparation command, readiness check, or DDEV problem, then run `doctor` again. Do not delete partial state manually.
+A failed creation may retain an error record, branch, worktree, database, route, or generated view when those resources were already owned. Fix the reported source, command, check, or host problem, then retry or remove through the CLI. Never delete partial state manually.
 
 ## Remove a workspace
 
-Removal is destructive and requires clear user intent. Inspect the owned target and preview removal before answering the single confirmation prompt:
+Removal is destructive and requires clear user intent. Inspect the target and preview removal first:
 
 ```sh
 ddev-workspaces list
@@ -108,19 +113,17 @@ ddev-workspaces remove --dry-run <name>
 ddev-workspaces remove <name>
 ```
 
-Normal removal retains the Git branch and DDEV data. Delete DDEV data only when the user explicitly requests it:
-
-For source-site workspaces, normal removal also recursively deletes the exact generated DDEV application directory printed by the dry run. It does not delete the source site.
+Copied databases are retained by default as `retained-data`; fresh databases are deleted automatically. Delete retained data only when the user explicitly requests it:
 
 ```sh
-ddev-workspaces remove --delete-ddev-data <name>
+ddev-workspaces remove --delete-database <name>
 ```
 
 In a non-interactive environment, add `--yes` only after the user has authorized the removal:
 
 ```sh
 ddev-workspaces remove --yes <name>
-ddev-workspaces remove --delete-ddev-data --yes <name>
+ddev-workspaces remove --delete-database --yes <name>
 ```
 
-Never force removal, manually erase the ownership record, or prune Git worktree metadata to get around a refusal. Report the blocking diagnostic and ask for direction when it cannot be resolved safely.
+Never force removal, erase ownership records, prune Git metadata, or stop the shared DDEV host to get around a refusal. Report the blocking diagnostic and ask for direction when it cannot be resolved safely.
