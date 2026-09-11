@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -6,31 +6,94 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::{ToolError, ToolResult};
 
-pub const STATE_DIRECTORY: &str = "ddev-workspaces/workspaces";
+pub const STATE_DIRECTORY: &str = ".ddev-workspaces";
+pub const RECORDS_DIRECTORY: &str = "workspaces";
+pub const LOCKS_DIRECTORY: &str = "locks";
+pub const LINKS_DIRECTORY: &str = "links";
+pub const VIEWS_DIRECTORY: &str = "views";
+pub const RESTART_MARKER: &str = ".restart-required";
+pub const RECORD_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceStatus {
+    Creating,
+    Ready,
+    Error,
+    Removing,
+    RetainedData,
+}
+
+impl WorkspaceStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Ready => "ready",
+            Self::Error => "error",
+            Self::Removing => "removing",
+            Self::RetainedData => "retained-data",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseProvenance {
+    Copy,
+    Fresh,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseRecord {
+    pub name: String,
+    pub provenance: DatabaseProvenance,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub prepared: bool,
+    #[serde(default)]
+    pub ownership_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedPaths {
+    pub link: String,
+    #[serde(default)]
+    pub view: Option<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub writable: Vec<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OwnershipRecord {
     pub version: u32,
     pub project_id: String,
+    pub workspace_name: String,
+    pub resource_key: String,
+    pub adapter: String,
+    pub repository_root: String,
     pub common_directory: String,
+    pub host_root: String,
     pub worktree_path: String,
     pub base_sha: String,
     pub branch: String,
-    pub ddev_name: String,
-    pub source_only: bool,
-    pub ddev_app_root: Option<String>,
+    pub hostname: String,
+    pub url: String,
+    pub database: DatabaseRecord,
+    pub paths: OwnedPaths,
+    pub status: WorkspaceStatus,
     #[serde(default)]
-    pub source_site: bool,
+    pub error: Option<String>,
 }
 
 impl OwnershipRecord {
-    pub fn uses_source_site(&self) -> bool {
-        self.source_site
-            || self
-                .ddev_app_root
-                .as_deref()
-                .is_some_and(|root| Path::new(root).is_absolute())
+    pub fn is_retained_data(&self) -> bool {
+        matches!(self.status, WorkspaceStatus::RetainedData)
     }
 }
 
@@ -40,86 +103,314 @@ pub struct RecordEntry {
     pub record: Result<OwnershipRecord, String>,
 }
 
-pub fn records_directory(common_directory: &Path) -> PathBuf {
-    common_directory.join(STATE_DIRECTORY)
+pub struct FileLock {
+    file: File,
 }
 
-pub fn record_path(common_directory: &Path, name: &str) -> PathBuf {
-    records_directory(common_directory).join(format!("{name}.toml"))
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
-pub fn reserve(common_directory: &Path, record: &OwnershipRecord) -> ToolResult<PathBuf> {
-    ensure_records_directory(common_directory)?;
-    let path = record_path(common_directory, &record.branch);
+pub fn state_root(host_root: &Path) -> PathBuf {
+    host_root.join(STATE_DIRECTORY)
+}
+
+pub fn records_directory(host_root: &Path) -> PathBuf {
+    state_root(host_root).join(RECORDS_DIRECTORY)
+}
+
+pub fn locks_directory(host_root: &Path) -> PathBuf {
+    state_root(host_root).join(LOCKS_DIRECTORY)
+}
+
+pub fn links_directory(host_root: &Path) -> PathBuf {
+    state_root(host_root).join(LINKS_DIRECTORY)
+}
+
+pub fn views_directory(host_root: &Path) -> PathBuf {
+    state_root(host_root).join(VIEWS_DIRECTORY)
+}
+
+pub fn record_path(host_root: &Path, resource_key: &str) -> PathBuf {
+    records_directory(host_root).join(format!("{resource_key}.toml"))
+}
+
+pub fn ensure_state(host_root: &Path) -> ToolResult<()> {
+    ensure_directory(&state_root(host_root), "host-local state directory")?;
+    ensure_directory(&records_directory(host_root), "workspace record directory")?;
+    ensure_directory(&locks_directory(host_root), "workspace lock directory")?;
+    ensure_directory(&links_directory(host_root), "workspace link directory")?;
+    ensure_directory(&views_directory(host_root), "workspace view directory")?;
+    let ignore = state_root(host_root).join(".gitignore");
+    match fs::symlink_metadata(&ignore) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            validate_state_ignore(&ignore)?;
+        }
+        Ok(_) => {
+            return Err(ToolError::new(format!(
+                "host-local state ignore file {} is not a regular file",
+                ignore.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let result = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&ignore);
+            match result {
+                Ok(mut file) => {
+                    set_private(&file)?;
+                    file.write_all(b"*\n!.gitignore\n")?;
+                    file.sync_all()?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_regular_file(&ignore, "host-local state ignore file")?;
+                    validate_state_ignore(&ignore)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn validate_state_ignore(path: &Path) -> ToolResult<()> {
+    let contents = fs::read_to_string(path)?;
+    if contents != "*\n!.gitignore\n" {
+        return Err(ToolError::new(format!(
+            "host-local state ignore file {} does not match the CLI-owned contract; inspect it manually",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub fn restart_required(host_root: &Path) -> ToolResult<bool> {
+    let path = state_root(host_root).join(RESTART_MARKER);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(ToolError::new(format!(
+            "host restart marker {} is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn mark_restart_required(host_root: &Path) -> ToolResult<()> {
+    ensure_state(host_root)?;
+    let path = state_root(host_root).join(RESTART_MARKER);
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            set_private(&file)?;
+            file.write_all(b"ddev-workspaces\n")?;
+            file.sync_all()?;
+            sync_directory(path.parent())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure_regular_file(&path, "host restart marker")
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn clear_restart_required(host_root: &Path) -> ToolResult<()> {
+    let path = state_root(host_root).join(RESTART_MARKER);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(&path)?;
+            sync_directory(path.parent())
+        }
+        Ok(_) => Err(ToolError::new(format!(
+            "host restart marker {} is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn acquire_host_lock(host_root: &Path) -> ToolResult<FileLock> {
+    acquire_lock(host_root, "host")
+}
+
+pub fn acquire_workspace_lock(host_root: &Path, resource_key: &str) -> ToolResult<FileLock> {
+    acquire_lock(host_root, resource_key)
+}
+
+fn acquire_lock(host_root: &Path, name: &str) -> ToolResult<FileLock> {
+    ensure_state(host_root)?;
+    validate_lock_name(name)?;
+    let path = locks_directory(host_root).join(format!("{name}.lock"));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| {
+            ToolError::new(format!(
+                "cannot open workspace lock {}: {error}",
+                path.display()
+            ))
+        })?;
+    match file.try_lock() {
+        Ok(()) => Ok(FileLock { file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(ToolError::new(format!(
+            "workspace operation is already in progress; lock {} is held by another process",
+            path.display()
+        ))),
+        Err(std::fs::TryLockError::Error(error)) => Err(ToolError::new(format!(
+            "cannot acquire workspace lock {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+pub fn reserve(host_root: &Path, record: &OwnershipRecord) -> ToolResult<PathBuf> {
+    ensure_state(host_root)?;
+    validate_record_key(&record.resource_key)?;
+    let path = record_path(host_root, &record.resource_key);
     let contents = toml::to_string(record)?;
+    let temporary = path.with_file_name(format!(
+        ".{}.reserve-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("record"),
+        std::process::id()
+    ));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
+        .open(&temporary)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 ToolError::new(format!(
-                    "ownership record already exists at {}; refusing to adopt it",
-                    path.display()
+                    "workspace reservation staging file {} already exists; refusing to continue",
+                    temporary.display()
                 ))
             } else {
                 ToolError::new(format!(
-                    "cannot reserve ownership record {}: {error}",
-                    path.display()
+                    "cannot stage ownership record {}: {error}",
+                    temporary.display()
                 ))
             }
         })?;
+    set_private(&file)?;
     if let Err(error) = file
         .write_all(contents.as_bytes())
         .and_then(|_| file.sync_all())
     {
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&temporary);
         return Err(ToolError::new(format!(
             "initial ownership reservation failed at {}: {error}",
+            temporary.display()
+        )));
+    }
+    drop(file);
+    if let Err(error) = fs::hard_link(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(ToolError::new(format!(
+                "workspace resource {} is already reserved at {}; refusing to adopt it",
+                record.resource_key,
+                path.display()
+            )));
+        }
+        return Err(ToolError::new(format!(
+            "cannot publish ownership record {} atomically: {error}",
             path.display()
         )));
     }
+    fs::remove_file(&temporary)?;
+    sync_directory(path.parent())?;
     Ok(path)
 }
 
-pub fn load(common_directory: &Path, name: &str) -> ToolResult<(PathBuf, OwnershipRecord)> {
-    let path = record_path(common_directory, name);
-    ensure_record_file(&path).map_err(|error| {
+pub fn update(host_root: &Path, record: &OwnershipRecord) -> ToolResult<PathBuf> {
+    ensure_state(host_root)?;
+    validate_record_key(&record.resource_key)?;
+    let path = record_path(host_root, &record.resource_key);
+    ensure_regular_file(&path, "ownership record")?;
+    let contents = toml::to_string(record)?;
+    let temporary = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("record"),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| {
+            ToolError::new(format!(
+                "cannot create temporary ownership record {}: {error}",
+                temporary.display()
+            ))
+        })?;
+    set_private(&file)?;
+    let result = file
+        .write_all(contents.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            ToolError::new(format!(
+                "cannot write ownership record {}: {error}",
+                path.display()
+            ))
+        });
+    if result.is_ok() {
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(ToolError::new(format!(
+                "cannot publish ownership record {} atomically: {error}",
+                path.display()
+            )));
+        }
+        sync_directory(path.parent())?;
+    } else {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|_| path)
+}
+
+pub fn load(host_root: &Path, resource_key: &str) -> ToolResult<(PathBuf, OwnershipRecord)> {
+    validate_record_key(resource_key)?;
+    let path = record_path(host_root, resource_key);
+    ensure_regular_file(&path, "ownership record").map_err(|error| {
         ToolError::new(format!(
-            "no valid ownership record for `{name}` at {}: {error}; unmanaged paths are never removed",
+            "no valid ownership record for {resource_key} at {}: {error}; unmanaged resources are never removed",
             path.display()
         ))
     })?;
     let contents = fs::read_to_string(&path).map_err(|error| {
         ToolError::new(format!(
-            "no valid ownership record for `{name}` at {}: {error}; unmanaged paths are never removed",
+            "ownership record {} cannot be read: {error}; unmanaged resources are never removed",
             path.display()
         ))
     })?;
     let record = toml::from_str::<OwnershipRecord>(&contents).map_err(|error| {
         ToolError::new(format!(
-            "ownership record {} is invalid: {error}; repair or remove it manually",
+            "ownership record {} is invalid: {error}; repair it manually",
             path.display()
         ))
     })?;
-    if record.version != 1 {
-        return Err(ToolError::new(format!(
-            "ownership record {} has unsupported version {}; v1 refuses it",
-            path.display(),
-            record.version
-        )));
-    }
+    validate_loaded_record(&record, resource_key).map_err(|error| {
+        ToolError::new(format!(
+            "ownership record {} is invalid: {error}; repair it manually",
+            path.display()
+        ))
+    })?;
     Ok((path, record))
 }
 
-pub fn list(common_directory: &Path) -> ToolResult<Vec<RecordEntry>> {
-    let directory = records_directory(common_directory);
-    let manager_directory = directory
-        .parent()
-        .ok_or_else(|| ToolError::new("ownership directory has no parent"))?;
-    if !valid_directory(manager_directory)? {
-        return Ok(Vec::new());
-    }
+pub fn list(host_root: &Path) -> ToolResult<Vec<RecordEntry>> {
+    let directory = records_directory(host_root);
     if !valid_directory(&directory)? {
         return Ok(Vec::new());
     }
@@ -133,13 +424,13 @@ pub fn list(common_directory: &Path) -> ToolResult<Vec<RecordEntry>> {
         let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let record = ensure_record_file(&path)
+        let record = ensure_regular_file(&path, "ownership record")
             .map_err(|error| error.to_string())
             .and_then(|_| fs::read_to_string(&path).map_err(|error| error.to_string()))
             .and_then(|contents| {
                 toml::from_str::<OwnershipRecord>(&contents).map_err(|error| error.to_string())
             })
-            .and_then(validate_record_version);
+            .and_then(|record| validate_loaded_record(&record, name).map(|_| record));
         entries.push(RecordEntry {
             name: name.to_owned(),
             record,
@@ -149,13 +440,35 @@ pub fn list(common_directory: &Path) -> ToolResult<Vec<RecordEntry>> {
     Ok(entries)
 }
 
-fn ensure_records_directory(common_directory: &Path) -> ToolResult<()> {
-    let directory = records_directory(common_directory);
-    let manager_directory = directory
-        .parent()
-        .ok_or_else(|| ToolError::new("ownership directory has no parent"))?;
-    ensure_directory(manager_directory, "ownership manager directory")?;
-    ensure_directory(&directory, "ownership directory")
+pub fn delete(path: &Path) -> ToolResult<()> {
+    ensure_regular_file(path, "ownership record")?;
+    fs::remove_file(path).map_err(|error| {
+        ToolError::new(format!(
+            "owned resource cleanup finished but ownership record {} could not be deleted: {error}; recheck ownership before manual cleanup",
+            path.display()
+        ))
+    })?;
+    sync_directory(path.parent())
+}
+
+fn validate_loaded_record(record: &OwnershipRecord, key: &str) -> Result<(), String> {
+    if record.version != RECORD_VERSION {
+        return Err(format!(
+            "unsupported record version {}; only version 2 records are accepted",
+            record.version
+        ));
+    }
+    validate_record_key(&record.resource_key).map_err(|error| error.to_string())?;
+    if record.resource_key != key {
+        return Err("record key does not match its filename".to_owned());
+    }
+    if record.branch != record.workspace_name {
+        return Err("branch does not match workspace name".to_owned());
+    }
+    if record.adapter != "laravel" && record.adapter != "wordpress-component" {
+        return Err(format!("unsupported adapter {}", record.adapter));
+    }
+    Ok(())
 }
 
 fn ensure_directory(path: &Path, label: &str) -> ToolResult<()> {
@@ -169,11 +482,24 @@ fn ensure_directory(path: &Path, label: &str) -> ToolResult<()> {
             }
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|error| {
-                ToolError::new(format!("cannot create {label} {}: {error}", path.display()))
-            })
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    Err(ToolError::new(format!(
+                        "{label} {} is not a regular directory",
+                        path.display()
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(ToolError::new(format!(
+                "cannot create {label} {}: {error}",
+                path.display()
+            ))),
+        },
         Err(error) => Err(ToolError::new(format!(
             "cannot inspect {label} {}: {error}",
             path.display()
@@ -196,40 +522,66 @@ fn valid_directory(path: &Path) -> ToolResult<bool> {
     }
 }
 
-fn ensure_record_file(path: &Path) -> ToolResult<()> {
+fn ensure_regular_file(path: &Path, label: &str) -> ToolResult<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         ToolError::new(format!(
-            "ownership record {} cannot be inspected: {error}",
+            "{label} {} cannot be inspected: {error}",
             path.display()
         ))
     })?;
-    if !metadata.file_type().is_file() {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(ToolError::new(format!(
-            "ownership record {} is not a regular file; refusing to use it",
+            "{label} {} is not a regular file",
             path.display()
         )));
     }
     Ok(())
 }
 
-fn validate_record_version(record: OwnershipRecord) -> Result<OwnershipRecord, String> {
-    if record.version == 1 {
-        Ok(record)
-    } else {
-        Err(format!(
-            "unsupported ownership record version {}",
-            record.version
-        ))
+fn validate_record_key(value: &str) -> ToolResult<()> {
+    if value.is_empty()
+        || value.len() > 63
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        || value.starts_with('-')
+        || value.ends_with('-')
+    {
+        return Err(ToolError::new(format!(
+            "resource key {value} is not a safe lowercase name"
+        )));
     }
+    Ok(())
 }
 
-pub fn delete(path: &Path) -> ToolResult<()> {
-    fs::remove_file(path).map_err(|error| {
-        ToolError::new(format!(
-            "workspace was removed but ownership record {} could not be deleted: {error}; delete it manually only after rechecking ownership",
-            path.display()
-        ))
-    })
+fn validate_lock_name(value: &str) -> ToolResult<()> {
+    if value.is_empty()
+        || value.len() > 100
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
+    {
+        return Err(ToolError::new("lock name contains an unsafe character"));
+    }
+    Ok(())
+}
+
+fn sync_directory(path: Option<&Path>) -> ToolResult<()> {
+    if let Some(path) = path {
+        File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn set_private(file: &File) -> ToolResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -237,146 +589,96 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn record(directory: &Path) -> OwnershipRecord {
+    fn record(host: &Path) -> OwnershipRecord {
         OwnershipRecord {
-            version: 1,
+            version: 2,
             project_id: "fixture".to_owned(),
-            common_directory: directory.display().to_string(),
-            worktree_path: directory.join(".worktrees/task-1").display().to_string(),
+            workspace_name: "feature/test".to_owned(),
+            resource_key: "fixture-feature-test".to_owned(),
+            adapter: "laravel".to_owned(),
+            repository_root: host.display().to_string(),
+            common_directory: host.join(".git").display().to_string(),
+            host_root: host.display().to_string(),
+            worktree_path: host.join(".worktrees/feature-test").display().to_string(),
             base_sha: "0123456789012345678901234567890123456789".to_owned(),
-            branch: "task-1".to_owned(),
-            ddev_name: "dw-fixture--task-1".to_owned(),
-            source_only: false,
-            ddev_app_root: Some(".".to_owned()),
-            source_site: false,
+            branch: "feature/test".to_owned(),
+            hostname: "fixture-feature-test.fixture.ddev.site".to_owned(),
+            url: "https://fixture-feature-test.fixture.ddev.site".to_owned(),
+            database: DatabaseRecord {
+                name: "dw_fixture_feature_test".to_owned(),
+                provenance: DatabaseProvenance::Copy,
+                source: Some("db".to_owned()),
+                prepared: false,
+                ownership_token: Some("fixture-token".to_owned()),
+            },
+            paths: OwnedPaths {
+                link: host
+                    .join(".ddev-workspaces/links/fixture-feature-test")
+                    .display()
+                    .to_string(),
+                view: None,
+                files: Vec::new(),
+                writable: Vec::new(),
+            },
+            status: WorkspaceStatus::Creating,
+            error: None,
         }
     }
 
     #[test]
-    fn ownership_record_round_trips_toml_sensitive_values() {
-        let directory = tempdir().expect("temporary directory");
-        let mut expected = record(directory.path());
-        expected.project_id = "quotes \" slashes \\ controls\u{08}\t\n\u{0c}\r\u{1f}".to_owned();
-        expected.branch = "unicode-λ".to_owned();
-
-        let encoded = toml::to_string(&expected).expect("serialize ownership record");
-        let decoded: OwnershipRecord =
-            toml::from_str(&encoded).expect("deserialize ownership record");
-
-        assert_eq!(decoded, expected);
-    }
-
-    #[test]
-    fn reservation_is_exclusive_and_inspectable() {
-        let directory = tempdir().expect("temporary directory");
-        let first = record(directory.path());
-
-        let path = reserve(directory.path(), &first).expect("first reservation");
-        let second = reserve(directory.path(), &first).unwrap_err();
-        let (_, loaded) = load(directory.path(), "task-1").expect("record should load");
-
-        assert!(path.exists());
-        assert!(second.to_string().contains("already exists"));
-        assert_eq!(loaded, first);
-    }
-
-    #[test]
-    fn unknown_record_fields_are_rejected() {
-        let directory = tempdir().expect("temporary directory");
-        let path = record_path(directory.path(), "task-1");
-        fs::create_dir_all(path.parent().expect("record parent")).expect("record parent");
-        fs::write(
-            &path,
-            "version = 1\nproject_id = 'fixture'\ncommon_directory = '/tmp'\nworktree_path = '/tmp/task-1'\nbase_sha = '0123456789012345678901234567890123456789'\nbranch = 'task-1'\nddev_name = 'dw-fixture--task-1'\nsource_only = false\nddev_app_root = '.'\nfuture = true\n",
-        )
-        .expect("record should be written");
-
-        let error = load(directory.path(), "task-1").unwrap_err();
-
-        assert!(error.to_string().contains("invalid"));
-    }
-
-    #[test]
-    fn listing_is_empty_until_records_exist_then_sorts_and_reports_invalid_records() {
-        let directory = tempdir().expect("temporary directory");
-        assert!(list(directory.path()).expect("empty listing").is_empty());
-
-        let mut second = record(directory.path());
-        second.branch = "second".to_owned();
-        reserve(directory.path(), &second).expect("second record");
-        let mut first = record(directory.path());
-        first.branch = "first".to_owned();
-        reserve(directory.path(), &first).expect("first record");
-        fs::write(
-            records_directory(directory.path()).join("ignored.txt"),
-            "ignored",
-        )
-        .expect("non-record file");
-        fs::write(
-            records_directory(directory.path()).join("invalid.toml"),
-            "version = 2\n",
-        )
-        .expect("invalid record");
-
-        let entries = list(directory.path()).expect("record listing");
-
+    fn records_are_atomic_and_round_trip() {
+        let directory = tempdir().expect("host");
+        let expected = record(directory.path());
+        let path = reserve(directory.path(), &expected).expect("reserve");
+        let (_, loaded) = load(directory.path(), "fixture-feature-test").expect("load");
+        assert_eq!(loaded, expected);
+        let mut updated = expected.clone();
+        updated.status = WorkspaceStatus::Ready;
+        update(directory.path(), &updated).expect("atomic update");
         assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            ["first", "invalid", "second"]
+            load(directory.path(), "fixture-feature-test").unwrap().1,
+            updated
         );
-        assert!(entries[0].record.is_ok());
-        assert!(entries[1].record.is_err());
-        assert!(entries[2].record.is_ok());
-    }
-
-    #[test]
-    fn missing_and_unsupported_records_are_never_loaded_or_deleted_as_owned() {
-        let directory = tempdir().expect("temporary directory");
-        assert!(load(directory.path(), "missing").is_err());
-
-        let mut unsupported = record(directory.path());
-        unsupported.version = 2;
-        let path = reserve(directory.path(), &unsupported).expect("unsupported record fixture");
+        assert!(path.is_file());
         assert!(
-            load(directory.path(), "task-1")
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported version 2")
+            !fs::read_dir(records_directory(directory.path()))
+                .unwrap()
+                .any(|entry| entry.unwrap().file_name().to_string_lossy().contains("tmp"))
         );
-
-        delete(&path).expect("record deletion");
-        assert!(!path.exists());
-        assert!(delete(&path).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn symlinked_ownership_directories_and_records_are_rejected() {
-        use std::os::unix::fs::symlink;
+    fn same_resource_is_exclusive_and_lock_contention_is_refused() {
+        let directory = tempdir().expect("host");
+        let expected = record(directory.path());
+        reserve(directory.path(), &expected).expect("first reservation");
+        assert!(reserve(directory.path(), &expected).is_err());
+        let first = acquire_workspace_lock(directory.path(), "fixture-feature-test").expect("lock");
+        assert!(acquire_workspace_lock(directory.path(), "fixture-feature-test").is_err());
+        drop(first);
+        assert!(acquire_workspace_lock(directory.path(), "fixture-feature-test").is_ok());
+    }
 
-        let directory = tempdir().expect("temporary directory");
-        let outside = tempdir().expect("outside directory");
-        fs::create_dir(directory.path().join("ddev-workspaces"))
-            .expect("ownership manager directory");
-        symlink(
-            outside.path(),
-            directory.path().join("ddev-workspaces/workspaces"),
-        )
-        .expect("ownership directory symlink");
+    #[test]
+    fn invalid_record_versions_and_keys_are_not_removal_authority() {
+        let directory = tempdir().expect("host");
+        let mut expected = record(directory.path());
+        expected.version = 1;
+        reserve(directory.path(), &expected).expect("fixture record");
+        assert!(load(directory.path(), "fixture-feature-test").is_err());
+        assert!(acquire_workspace_lock(directory.path(), "../unsafe").is_err());
+    }
 
-        assert!(reserve(directory.path(), &record(directory.path())).is_err());
-        assert!(list(directory.path()).is_err());
-
-        fs::remove_file(directory.path().join("ddev-workspaces/workspaces"))
-            .expect("remove ownership symlink");
-        fs::create_dir(directory.path().join("ddev-workspaces/workspaces"))
-            .expect("ownership directory");
-        let target = outside.path().join("record.toml");
-        fs::write(&target, "version = 1\n").expect("record target");
-        symlink(&target, record_path(directory.path(), "task-1")).expect("record symlink");
-        assert!(load(directory.path(), "task-1").is_err());
+    #[test]
+    fn state_ignore_file_must_match_the_owned_contract() {
+        let directory = tempdir().expect("host");
+        ensure_state(directory.path()).expect("initial state");
+        fs::write(state_root(directory.path()).join(".gitignore"), "*.tmp\n").unwrap();
+        let error = ensure_state(directory.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the CLI-owned contract")
+        );
     }
 }

@@ -1,14 +1,22 @@
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, IsTerminal, Write};
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::ArgMatches;
 
-use crate::command::{CommandRunner, RealCommandRunner, ToolError, ToolResult};
-use crate::config::{self, CheckRule, CommandRule, ProjectConfig, ResolvedSourceSite};
-use crate::ddev::{self, DdevProject};
+use crate::command::{CommandRequest, CommandRunner, RealCommandRunner, ToolError, ToolResult};
+use crate::config::{self, DatabaseMode, ProjectConfig, RuntimePaths};
+use crate::ddev::{self, HostIdentity};
 use crate::git::{self, GitRepository, SourceDiagnostics};
-use crate::state::{self, OwnershipRecord, RecordEntry};
+use crate::runtime;
+use crate::runtime::PreparedRuntime;
+use crate::runtime::database::DatabaseContext;
+use crate::runtime::host::HostContext;
+use crate::state::{
+    self, DatabaseProvenance, DatabaseRecord, OwnedPaths, OwnershipRecord, RECORD_VERSION,
+    WorkspaceStatus,
+};
 
 pub fn run(matches: ArgMatches) -> ToolResult<u8> {
     let Some((command, arguments)) = matches.subcommand() else {
@@ -16,10 +24,808 @@ pub fn run(matches: ArgMatches) -> ToolResult<u8> {
     };
     match command {
         "doctor" => doctor(arguments),
+        "host" => host(arguments),
         "list" => list(arguments),
         "create" => create(arguments),
         "remove" => remove(arguments),
-        _ => Err(ToolError::usage(format!("unsupported command `{command}`"))),
+        _ => Err(ToolError::usage(format!("unsupported command {command}"))),
+    }
+}
+
+fn host(arguments: &ArgMatches) -> ToolResult<u8> {
+    let Some(("init", _)) = arguments.subcommand() else {
+        return Err(ToolError::usage("host requires the init subcommand"));
+    };
+    let mut runner = RealCommandRunner::new(false);
+    let signal_guard = runtime::SignalGuard::install()?;
+    let (repository, _config, paths) = load_project(Path::new("."), &mut runner)?;
+    require_main_repository(&repository)?;
+    let inspected_identity = ddev::inspect_host(&paths.host_root, &mut runner)?;
+    let _host_lock = state::acquire_host_lock(&paths.host_root)?;
+    let identity = ddev::inspect_host(&paths.host_root, &mut runner)?;
+    if !identity.same_runtime_identity(&inspected_identity) {
+        return Err(ToolError::new(
+            "DDEV host identity changed while waiting for the host lock; retry host initialization",
+        ));
+    }
+    let changed = runtime::host::init(&paths.host_root, &identity, &mut runner)?;
+    ensure_operation_not_interrupted(&signal_guard, "shared host initialization")?;
+    println!("Host: {}", paths.host_root.display());
+    println!("DDEV: {} ({})", identity.project.name, identity.hostname);
+    println!(
+        "Routing assets: {}",
+        if changed {
+            "installed"
+        } else {
+            "already current"
+        }
+    );
+    println!("State: {}", state::state_root(&paths.host_root).display());
+    Ok(0)
+}
+
+fn create(arguments: &ArgMatches) -> ToolResult<u8> {
+    let name = arguments
+        .get_one::<String>("name")
+        .map(String::as_str)
+        .ok_or_else(|| ToolError::usage("create requires a workspace name"))?;
+    config::validate_workspace_name(name)?;
+    let requested_base = arguments.get_one::<String>("base").map(String::as_str);
+    let fresh = arguments.get_flag("fresh");
+    let dry_run = arguments.get_flag("dry-run");
+    let mut runner = RealCommandRunner::new(dry_run);
+    let signal_guard = runtime::SignalGuard::install()?;
+    let (repository, project_config, paths) = load_project(Path::new("."), &mut runner)?;
+    require_main_repository(&repository)?;
+    let host = runtime::host::inspect(&project_config, paths.clone(), &mut runner)?;
+    let base = repository.resolve_base(requested_base, &mut runner)?;
+    let key = resolve_resource_key(&paths.host_root, &project_config, name)?;
+    let requested_database_mode = if fresh {
+        DatabaseMode::Fresh
+    } else {
+        project_config.database_mode()?
+    };
+    let database = DatabaseContext::from_host(&paths.host_root, &host.identity, &project_config)?;
+    let preflight_record = existing_record(&paths.host_root, &project_config, name)?;
+    let (workspace, database_name) = if let Some((_, record)) = &preflight_record {
+        validate_record_identity(
+            record,
+            &repository,
+            &project_config,
+            &paths,
+            &host.identity,
+            name,
+        )?;
+        let recorded_mode = database_mode_from_record(record);
+        if recorded_mode != requested_database_mode {
+            return Err(ToolError::new(format!(
+                "workspace {} was reserved with {} database mode; retry with the same configuration and --fresh setting",
+                name,
+                database_mode_label(recorded_mode)
+            )));
+        }
+        if record.is_retained_data() {
+            return Err(ToolError::new(format!(
+                "workspace {} retains database {}; remove it with --delete-database before recreating the same name",
+                name, record.database.name
+            )));
+        }
+        if matches!(record.status, WorkspaceStatus::Ready) {
+            return Err(ToolError::new(format!(
+                "workspace {} is already ready at {}",
+                name, record.url
+            )));
+        }
+        if matches!(record.status, WorkspaceStatus::Removing) {
+            return Err(ToolError::new(format!(
+                "workspace {} is being removed; finish removal before retrying create",
+                name
+            )));
+        }
+        (
+            PathBuf::from(&record.worktree_path),
+            record.database.name.clone(),
+        )
+    } else {
+        let workspace = paths.worktree_root.join(&key);
+        ensure_unclaimed_runtime_paths(&project_config, &paths, &key)?;
+        repository.ensure_worktree_available(&workspace, name, &mut runner)?;
+        let database_name = database_name(&key)?;
+        if database.exists(&database_name, &mut runner)? {
+            return Err(ToolError::new(format!(
+                "workspace database {} already exists without a resumable ownership record; unmanaged databases are never adopted",
+                database_name
+            )));
+        }
+        (workspace, database_name)
+    };
+    if dry_run {
+        print_create_plan(
+            &project_config,
+            &host.identity,
+            name,
+            &key,
+            &workspace,
+            &base,
+            requested_database_mode,
+            &database_name,
+        );
+        return Ok(0);
+    }
+
+    state::ensure_state(&paths.host_root)?;
+    runtime::ensure_regular_directory(&paths.worktree_root, "configured worktree root")?;
+    let identity_lock_key = config::resource_key(&project_config.project_id, name);
+    let _workspace_lock = state::acquire_workspace_lock(&paths.host_root, &identity_lock_key)?;
+    let locked_key = resolve_resource_key(&paths.host_root, &project_config, name)?;
+    if locked_key != key {
+        return Err(ToolError::new(
+            "workspace resource identity changed while waiting for its lock; retry the operation",
+        ));
+    }
+    let existing = existing_record(&paths.host_root, &project_config, name)?;
+    let mut record = if let Some((_, record)) = existing {
+        validate_record_identity(
+            &record,
+            &repository,
+            &project_config,
+            &paths,
+            &host.identity,
+            name,
+        )?;
+        let recorded_mode = database_mode_from_record(&record);
+        if recorded_mode != requested_database_mode {
+            return Err(ToolError::new(format!(
+                "workspace {} was reserved with {} database mode; retry with the same configuration and --fresh setting",
+                name,
+                database_mode_label(recorded_mode)
+            )));
+        }
+        if record.is_retained_data() {
+            return Err(ToolError::new(format!(
+                "workspace {} retains database {}; remove it with --delete-database before recreating the same name",
+                name, record.database.name
+            )));
+        }
+        if matches!(record.status, WorkspaceStatus::Ready) {
+            return Err(ToolError::new(format!(
+                "workspace {} is already ready at {}",
+                name, record.url
+            )));
+        }
+        if matches!(record.status, WorkspaceStatus::Removing) {
+            return Err(ToolError::new(format!(
+                "workspace {} is being removed; finish removal before retrying create",
+                name
+            )));
+        }
+        record
+    } else {
+        let _host_lock = state::acquire_host_lock(&paths.host_root)?;
+        require_locked_host(&paths.host_root, &host.identity, &mut runner)?;
+        repository.ensure_worktree_available(&workspace, name, &mut runner)?;
+        if database.exists(&database_name, &mut runner)? {
+            return Err(ToolError::new(format!(
+                "workspace database {} appeared while reserving the workspace; unmanaged databases are never adopted",
+                database_name
+            )));
+        }
+        let record = new_record(
+            &repository,
+            &project_config,
+            &paths,
+            &host.identity,
+            name,
+            &key,
+            &base,
+            requested_database_mode,
+            &database_name,
+        )?;
+        ensure_operation_not_interrupted(&signal_guard, "workspace reservation")?;
+        state::reserve(&paths.host_root, &record)?;
+        record
+    };
+    record.status = WorkspaceStatus::Creating;
+    record.error = None;
+    state::update(&paths.host_root, &record)?;
+    ensure_operation_not_interrupted(&signal_guard, "workspace creation")?;
+    match create_reserved(
+        &repository,
+        &project_config,
+        &paths,
+        &host,
+        &mut record,
+        requested_database_mode,
+        &signal_guard,
+        &mut runner,
+    ) {
+        Ok(()) => {
+            println!("Workspace: {}", record.workspace_name);
+            println!("URL: {}", record.url);
+            println!("Database: {}", record.database.name);
+            println!("READY");
+            Ok(0)
+        }
+        Err(error) => Err(record_failure(&paths.host_root, &mut record, error)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_reserved<R: CommandRunner>(
+    repository: &GitRepository,
+    config: &ProjectConfig,
+    paths: &RuntimePaths,
+    host: &HostContext,
+    record: &mut OwnershipRecord,
+    database_mode: DatabaseMode,
+    signal_guard: &runtime::SignalGuard,
+    runner: &mut R,
+) -> ToolResult<()> {
+    let recorded_mode = database_mode_from_record(record);
+    if recorded_mode != database_mode {
+        return Err(ToolError::new(
+            "requested database mode does not match the ownership record; retry with the original mode",
+        ));
+    }
+    {
+        let _host_lock = state::acquire_host_lock(&paths.host_root)?;
+        require_locked_host(&paths.host_root, &host.identity, runner)?;
+    }
+    ensure_operation_not_interrupted(signal_guard, "workspace preparation")?;
+    let workspace = Path::new(&record.worktree_path);
+    match fs::symlink_metadata(workspace) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ToolError::new(
+                "recorded workspace path is a symlink; refusing adoption",
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(ToolError::new(
+                "recorded workspace path is not a directory; refusing adoption",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            repository.add_worktree(workspace, &record.branch, &record.base_sha, runner)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    ensure_operation_not_interrupted(signal_guard, "worktree preparation")?;
+    if config.runtime.adapter == "laravel" && record.paths.files.is_empty() {
+        let planned = runtime::laravel::planned_files(config, paths, workspace)?;
+        if !planned.is_empty()
+            && planned
+                .iter()
+                .all(|path| matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
+        {
+            record.paths.files = planned
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            state::update(&paths.host_root, record)?;
+        }
+    }
+    let workspace_repository =
+        validate_owned_worktree(repository, workspace, record, runner, true)?;
+    workspace_repository.initialize_submodules(runner)?;
+    workspace_repository.checkout_lfs(runner)?;
+    let source = workspace_repository.diagnose(Some(&record.base_sha), runner)?;
+    if !source.ready() {
+        return Err(ToolError::new(format_source_failure(&source)));
+    }
+
+    let needs_adapter_prepare = if config.runtime.adapter == "wordpress-component" {
+        match record.paths.view.as_deref() {
+            None => true,
+            Some(view) => {
+                let expected_view =
+                    state::views_directory(&paths.host_root).join(&record.resource_key);
+                if Path::new(view) != expected_view {
+                    return Err(ToolError::new(
+                        "recorded generated view does not match the resource key",
+                    ));
+                }
+                let files = record
+                    .paths
+                    .files
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                let writable = record
+                    .paths
+                    .writable
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                match fs::symlink_metadata(view) {
+                    Ok(_) => !runtime::wordpress::view_is_complete(
+                        config,
+                        Path::new(view),
+                        workspace,
+                        &record.resource_key,
+                        &files,
+                        &writable,
+                    )?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    } else if config.runtime.adapter == "laravel" {
+        laravel_runtime_needs_prepare(record)?
+    } else {
+        return Err(ToolError::new(format!(
+            "unsupported runtime adapter {}",
+            config.runtime.adapter
+        )));
+    };
+    let prepared = if needs_adapter_prepare {
+        if config.runtime.adapter == "wordpress-component" {
+            record.paths.files.clear();
+            record.paths.writable.clear();
+            let view = state::views_directory(&paths.host_root).join(&record.resource_key);
+            let view_exists = match fs::symlink_metadata(&view) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if view_exists {
+                if runtime::wordpress::view_is_owned(&view, &record.resource_key)? {
+                    runtime::wordpress::remove_owned_view(&view, &record.resource_key)?;
+                } else {
+                    return Err(ToolError::new(format!(
+                        "WordPress generated view {} already exists without a complete ownership record; inspect it manually",
+                        view.display()
+                    )));
+                }
+            } else {
+                record.paths.view = Some(view.display().to_string());
+                state::update(&paths.host_root, record)?;
+            }
+        }
+        let prepared = prepare_adapter(
+            config,
+            paths,
+            workspace,
+            &record.resource_key,
+            &record.database.name,
+            &record.url,
+        )?;
+        record.paths = owned_paths(&prepared, &record.paths.link);
+        state::update(&paths.host_root, record)?;
+        prepared
+    } else {
+        prepared_from_record(config, paths, workspace, record, false)?
+    };
+    ensure_operation_not_interrupted(signal_guard, "runtime preparation")?;
+
+    let runtime_root = prepared.view.as_deref().unwrap_or(workspace);
+    let database = DatabaseContext::from_host(&paths.host_root, &host.identity, config)?;
+    if !record.database.prepared {
+        if record.database.ownership_token.is_none() {
+            record.database.ownership_token =
+                Some(database_ownership_token(config, &record.workspace_name)?);
+            state::update(&paths.host_root, record)?;
+        }
+        let ownership_token = record
+            .database
+            .ownership_token
+            .as_deref()
+            .ok_or_else(|| ToolError::new("workspace database ownership token is missing"))?;
+        if database.exists(&record.database.name, runner)? {
+            if !database.owns(&record.database.name, ownership_token, runner)? {
+                return Err(ToolError::new(format!(
+                    "workspace database {} already exists without a completed ownership record; inspect and remove it manually before retrying",
+                    record.database.name
+                )));
+            }
+            record.database.prepared = true;
+            state::update(&paths.host_root, record)?;
+        } else {
+            database.prepare(
+                &record.database.name,
+                database_mode,
+                ownership_token,
+                runner,
+            )?;
+            record.database.prepared = true;
+            state::update(&paths.host_root, record)?;
+        }
+    } else if !database.exists(&record.database.name, runner)? {
+        return Err(ToolError::new(format!(
+            "workspace database {} was recorded as prepared but is missing; inspect the retained ownership record before retrying",
+            record.database.name
+        )));
+    } else if record.database.ownership_token.is_none() {
+        return Err(ToolError::new(
+            "workspace database ownership token is missing from a prepared record; inspect it manually before retrying",
+        ));
+    }
+    ensure_operation_not_interrupted(signal_guard, "database preparation")?;
+    run_provision(config, runtime_root, database_mode, runner)?;
+    run_checks(config, runtime_root)?;
+    ensure_only_owned_changes(&workspace_repository, &prepared, runner)?;
+    ensure_route_target_is_safe(config, &prepared.route_target, workspace, &paths.host_root)?;
+    ensure_operation_not_interrupted(signal_guard, "workspace checks")?;
+
+    {
+        let _host_lock = state::acquire_host_lock(&paths.host_root)?;
+        require_locked_host(&paths.host_root, &host.identity, runner)?;
+        ddev::publish_link(
+            &paths.host_root,
+            &record.resource_key,
+            &prepared.route_target,
+        )?;
+    }
+    if signal_guard.interrupted() {
+        let rollback = rollback_route(
+            &paths.host_root,
+            &host.identity,
+            &record.resource_key,
+            &prepared.route_target,
+            runner,
+        );
+        return match rollback {
+            Ok(()) => Err(ToolError::new(
+                "workspace creation interrupted after route publication; route was rolled back",
+            )),
+            Err(rollback_error) => Err(ToolError::new(format!(
+                "workspace creation interrupted after route publication; route rollback also failed: {rollback_error}"
+            ))),
+        };
+    }
+    if host.identity.project.mutagen_enabled
+        && let Err(error) = ddev::sync_mutagen(&paths.host_root, &record.resource_key, runner)
+    {
+        let rollback = rollback_route(
+            &paths.host_root,
+            &host.identity,
+            &record.resource_key,
+            &prepared.route_target,
+            runner,
+        );
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(ToolError::new(format!(
+                "{error}; route rollback also failed: {rollback_error}"
+            ))),
+        };
+    }
+    record.status = WorkspaceStatus::Ready;
+    record.error = None;
+    if let Err(error) = state::update(&paths.host_root, record) {
+        let rollback = rollback_route(
+            &paths.host_root,
+            &host.identity,
+            &record.resource_key,
+            &prepared.route_target,
+            runner,
+        );
+        if let Err(rollback_error) = rollback {
+            return Err(ToolError::new(format!(
+                "could not persist the ready workspace record: {error}; route rollback also failed: {rollback_error}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn rollback_route<R: CommandRunner>(
+    host_root: &Path,
+    identity: &HostIdentity,
+    resource_key: &str,
+    route_target: &Path,
+    runner: &mut R,
+) -> ToolResult<()> {
+    let _host_lock = state::acquire_host_lock(host_root)?;
+    require_locked_host(host_root, identity, runner)?;
+    ddev::unpublish_link(host_root, resource_key, route_target)
+}
+
+fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
+    let name = arguments
+        .get_one::<String>("name")
+        .map(String::as_str)
+        .ok_or_else(|| ToolError::usage("remove requires a workspace name"))?;
+    config::validate_workspace_name(name)?;
+    let dry_run = arguments.get_flag("dry-run");
+    let delete_database = arguments.get_flag("delete-database");
+    let yes = arguments.get_flag("yes");
+    let mut runner = RealCommandRunner::new(false);
+    let signal_guard = runtime::SignalGuard::install()?;
+    let (repository, config, paths) = load_project(Path::new("."), &mut runner)?;
+    require_main_repository(&repository)?;
+    let identity_lock_key = config::resource_key(&config.project_id, name);
+    let _workspace_lock = state::acquire_workspace_lock(&paths.host_root, &identity_lock_key)?;
+    let (record_path, mut record) =
+        existing_record(&paths.host_root, &config, name)?.ok_or_else(|| {
+            ToolError::new(format!(
+                "no ownership record for workspace {name}; unmanaged resources are never removed"
+            ))
+        })?;
+    let host = runtime::host::inspect(&config, paths.clone(), &mut runner)?;
+    validate_record_identity(&record, &repository, &config, &paths, &host.identity, name)?;
+    ensure_operation_not_interrupted(&signal_guard, "workspace removal")?;
+
+    if record.is_retained_data() {
+        validate_retained_record(&record, &paths)?;
+        if !delete_database {
+            return Err(ToolError::new(format!(
+                "workspace {} retains database {}; pass --delete-database to remove the retained data",
+                name, record.database.name
+            )));
+        }
+        println!(
+            "Will delete retained database {} and ownership record {}; branch {} remains.",
+            record.database.name,
+            record_path.display(),
+            record.branch
+        );
+        if dry_run {
+            println!("DRY RUN — no database or ownership mutation performed");
+            return Ok(0);
+        }
+        require_confirmation(name, yes)?;
+        ensure_operation_not_interrupted(&signal_guard, "workspace removal confirmation")?;
+        let (current_record_path, current_record) =
+            state::load(&paths.host_root, &record.resource_key)?;
+        if current_record_path != record_path || current_record != record {
+            return Err(ToolError::new(
+                "retained workspace ownership changed after confirmation; rerun removal",
+            ));
+        }
+        let _host_lock = state::acquire_host_lock(&paths.host_root)?;
+        require_locked_host(&paths.host_root, &host.identity, &mut runner)?;
+        validate_retained_record(&record, &paths)?;
+        let database = DatabaseContext::from_host(&paths.host_root, &host.identity, &config)?;
+        if database.exists(&record.database.name, &mut runner)? {
+            let ownership_token = record.database.ownership_token.as_deref().ok_or_else(|| {
+                ToolError::new("retained workspace database ownership token is missing")
+            })?;
+            database.drop_owned(&record.database.name, ownership_token, &mut runner)?;
+        }
+        state::delete(&record_path)?;
+        println!(
+            "Removed retained data for {name}; branch {} remains.",
+            record.branch
+        );
+        return Ok(0);
+    }
+
+    let workspace = Path::new(&record.worktree_path);
+    let has_owned_runtime = workspace.exists()
+        || record.paths.view.is_some()
+        || !record.paths.files.is_empty()
+        || !record.paths.writable.is_empty();
+    let prepared = if has_owned_runtime {
+        Some(prepared_from_record(
+            &config,
+            &paths,
+            workspace,
+            &record,
+            !matches!(record.status, WorkspaceStatus::Ready),
+        )?)
+    } else {
+        match fs::symlink_metadata(&record.paths.link) {
+            Ok(_) => {
+                return Err(ToolError::new(
+                    "workspace record has no materialized runtime, but its route still exists; refusing cleanup without exact ownership proof",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let workspace_repository = match fs::symlink_metadata(workspace) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ToolError::new(
+                "recorded workspace path is a symlink; refusing removal",
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => Some(validate_owned_worktree(
+            &repository,
+            workspace,
+            &record,
+            &mut runner,
+            false,
+        )?),
+        Ok(_) => {
+            return Err(ToolError::new(
+                "recorded workspace path is not a directory; refusing removal",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let (Some(workspace_repository), Some(prepared)) = (&workspace_repository, prepared.as_ref())
+    {
+        ensure_only_owned_changes(workspace_repository, prepared, &mut runner)?;
+    }
+    let database = DatabaseContext::from_host(&paths.host_root, &host.identity, &config)?;
+    let database_exists = database.exists(&record.database.name, &mut runner)?;
+    let database_owned = if !record.database.prepared && database_exists {
+        record
+            .database
+            .ownership_token
+            .as_deref()
+            .map(|token| database.owns(&record.database.name, token, &mut runner))
+            .transpose()?
+            .unwrap_or(false)
+    } else {
+        record.database.prepared
+    };
+    if database_exists && !database_owned {
+        return Err(ToolError::new(format!(
+            "workspace database {} exists but database ownership was not durably completed; refusing automatic deletion even with --delete-database; inspect and remove it manually before retrying",
+            record.database.name
+        )));
+    }
+    println!("Will remove workspace path {}.", workspace.display());
+    println!("Will remove route {}.", record.url);
+    println!("Will retain branch {}.", record.branch);
+    if database_owned
+        && matches!(record.database.provenance, DatabaseProvenance::Copy)
+        && !delete_database
+    {
+        println!(
+            "Will retain copied database {} as retained-data ownership.",
+            record.database.name
+        );
+    } else {
+        println!("Will delete database {}.", record.database.name);
+    }
+    if dry_run {
+        println!("DRY RUN — no route, file, Git, database, or ownership mutation performed");
+        return Ok(0);
+    }
+    require_confirmation(name, yes)?;
+    ensure_operation_not_interrupted(&signal_guard, "workspace removal confirmation")?;
+
+    let (_, current_record) = state::load(&paths.host_root, &record.resource_key)?;
+    validate_record_identity(
+        &current_record,
+        &repository,
+        &config,
+        &paths,
+        &host.identity,
+        name,
+    )?;
+    if current_record != record {
+        return Err(ToolError::new(
+            "workspace ownership changed after confirmation; rerun removal",
+        ));
+    }
+    {
+        let _host_lock = state::acquire_host_lock(&paths.host_root)?;
+        require_locked_host(&paths.host_root, &host.identity, &mut runner)?;
+        let locked_database_exists = database.exists(&record.database.name, &mut runner)?;
+        let locked_database_owned = if !record.database.prepared && locked_database_exists {
+            record
+                .database
+                .ownership_token
+                .as_deref()
+                .map(|token| database.owns(&record.database.name, token, &mut runner))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            record.database.prepared
+        };
+        if locked_database_exists && !locked_database_owned {
+            return Err(ToolError::new(format!(
+                "workspace database {} appeared without durable ownership during removal; refusing automatic deletion; inspect and remove it manually before retrying",
+                record.database.name
+            )));
+        }
+        if locked_database_owned && !record.database.prepared {
+            record.database.prepared = true;
+        }
+        record.status = WorkspaceStatus::Removing;
+        record.error = Some("removal in progress; rerun remove to continue if it fails".to_owned());
+        state::update(&paths.host_root, &record)?;
+        if let Some(prepared) = prepared.as_ref() {
+            ddev::unpublish_link(
+                &paths.host_root,
+                &record.resource_key,
+                &prepared.route_target,
+            )?;
+        }
+    }
+    ensure_operation_not_interrupted(&signal_guard, "route removal")?;
+    if let Some(prepared) = prepared.as_ref() {
+        cleanup_adapter(&config, prepared, workspace, &mut runner)?;
+    }
+    ensure_operation_not_interrupted(&signal_guard, "runtime cleanup")?;
+    if let Some(workspace_repository) = workspace_repository {
+        workspace_repository.worktree_is_clean(workspace, &mut runner)?;
+        repository.remove_worktree(workspace, &mut runner)?;
+    }
+    ensure_operation_not_interrupted(&signal_guard, "worktree removal")?;
+    let retain_database = record.database.prepared
+        && matches!(record.database.provenance, DatabaseProvenance::Copy)
+        && !delete_database;
+    {
+        let _host_lock = state::acquire_host_lock(&paths.host_root)?;
+        require_locked_host(&paths.host_root, &host.identity, &mut runner)?;
+        if !retain_database
+            && record.database.prepared
+            && database.exists(&record.database.name, &mut runner)?
+        {
+            let ownership_token =
+                record.database.ownership_token.as_deref().ok_or_else(|| {
+                    ToolError::new("workspace database ownership token is missing")
+                })?;
+            database.drop_owned(&record.database.name, ownership_token, &mut runner)?;
+        }
+        if retain_database {
+            record.status = WorkspaceStatus::RetainedData;
+            record.error = None;
+            record.paths.view = None;
+            record.paths.files.clear();
+            record.paths.writable.clear();
+            state::update(&paths.host_root, &record)?;
+        } else {
+            state::delete(&record_path)?;
+        }
+    }
+    if retain_database {
+        println!(
+            "Removed workspace {}; retained database {}. Branch {} remains.",
+            name, record.database.name, record.branch
+        );
+    } else {
+        println!(
+            "Removed workspace {name}; branch {} remains.",
+            record.branch
+        );
+    }
+    Ok(0)
+}
+
+fn list(arguments: &ArgMatches) -> ToolResult<u8> {
+    let _ = arguments;
+    let mut runner = RealCommandRunner::new(false);
+    let (repository, config, paths) = load_project(Path::new("."), &mut runner)?;
+    let entries = current_project_entries(state::list(&paths.host_root)?, &repository, &config);
+    println!("Repository: {}", repository.main_worktree.display());
+    println!("Host: {}", paths.host_root.display());
+    if entries.is_empty() {
+        println!("No managed workspaces.");
+        return Ok(0);
+    }
+    let host_status = ddev::inspect_host(&paths.host_root, &mut runner)
+        .map(|identity| format!("{} ({})", identity.project.name, identity.hostname))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    println!("DDEV host: {host_status}");
+    let mut ready = true;
+    for entry in entries {
+        match entry.record {
+            Ok(record) => {
+                println!(
+                    "{}  {}  {}  {}",
+                    record.workspace_name,
+                    record.status.label(),
+                    record.url,
+                    record.database.name
+                );
+                if let Some(error) = record.error {
+                    println!("  error: {error}");
+                }
+                if !matches!(record.status, WorkspaceStatus::Ready) {
+                    ready = false;
+                }
+            }
+            Err(error) => {
+                ready = false;
+                println!("{}  invalid-record  {error}", entry.name);
+            }
+        }
+    }
+    if ready {
+        Ok(0)
+    } else {
+        println!("NOT READY — one or more records require attention");
+        Ok(1)
     }
 }
 
@@ -31,1583 +837,1181 @@ fn doctor(arguments: &ArgMatches) -> ToolResult<u8> {
     let mut runner = RealCommandRunner::new(false);
     let repository = GitRepository::discover(&path, &mut runner)?;
     let diagnostics = repository.diagnose(None, &mut runner)?;
-
     println!("Repository: {}", repository.root.display());
     println!("Git common directory: {}", repository.common_dir.display());
     print_source_diagnostics(&diagnostics);
-    let (managed_record, ownership_issues) = ownership_state_for_path(&repository);
-    for issue in &ownership_issues {
-        println!("Ownership: NOT READY — {issue}");
-    }
-
-    let source_only_record = managed_record
-        .as_ref()
-        .is_some_and(|(_, record)| record.source_only);
-    let config_result = ProjectConfig::load(&repository.main_worktree).and_then(|config| {
-        if source_only_record {
-            config.validate_structure(&repository.main_worktree, &mut runner)?;
-        } else {
-            config.validate(&repository.main_worktree, &mut runner)?;
-        }
-        Ok(config)
-    });
-    let config_ready = match config_result {
-        Ok(config) => {
-            println!("Configuration: READY");
-            let mut ready = true;
-            let mut source_only_ready = false;
-            if let Some((record_name, record)) = &managed_record {
-                let ownership_ready = match verify_removal_target(
-                    &repository,
-                    &config,
-                    record_name,
-                    record,
-                    &mut runner,
-                ) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        println!("Ownership: NOT READY — {error}");
-                        ready = false;
-                        false
-                    }
-                };
-                source_only_ready = ownership_ready && record.source_only;
-                if source_only_ready {
-                    println!("Runtime: skipped by --source-only");
-                } else {
-                    if let Some(reason) = runtime_precondition_failure(&config, &repository.root) {
-                        println!("Runtime: NOT READY — {reason}");
-                        ready = false;
-                    } else {
-                        println!("Runtime: READY");
-                    }
+    let config = ProjectConfig::load(&repository.main_worktree)?;
+    let paths = config.validate_structure(&repository.main_worktree, &mut runner)?;
+    println!("Configuration: READY");
+    let mut ready = diagnostics.ready();
+    let host_identity = match ddev::inspect_host(&paths.host_root, &mut runner) {
+        Ok(identity) => {
+            println!(
+                "DDEV host: READY — {} ({})",
+                identity.project.name, identity.hostname
+            );
+            match ddev::require_initialized(&paths.host_root, &identity) {
+                Ok(()) => println!("Routing: READY"),
+                Err(error) => {
+                    println!("Routing: NOT READY — {error}");
+                    ready = false;
                 }
-                println!("Ownership: {}", record.ddev_name);
             }
-            if source_only_ready {
-                println!("DDEV: skipped by --source-only");
-            } else if let Some(ddev_config) = &config.ddev {
-                let app_root = if let Some((_, record)) = &managed_record {
-                    record
-                        .ddev_app_root
-                        .as_deref()
-                        .map(|value| recorded_app_root(&repository.root, value))
-                        .transpose()?
-                        .ok_or_else(|| ToolError::new("managed DDEV workspace has no app root"))?
-                } else {
-                    ddev_config
-                        .source_site
-                        .as_ref()
-                        .map(|_| config::source_site_root(&repository.main_worktree))
-                        .transpose()?
-                        .unwrap_or(config::safe_join(&repository.root, &ddev_config.app_root)?)
-                };
-                match ddev::list(&mut runner, &app_root) {
-                    Ok(inspection) => {
-                        for warning in &inspection.warnings {
-                            println!("DDEV: {warning}");
-                        }
-                        if let Some((_, record)) = &managed_record {
-                            match find_owned_ddev(&inspection.entries, &record.ddev_name, &app_root)
-                            {
-                                Ok(Some(project)) => {
-                                    match ddev::require_ready_identity(
-                                        &inspection,
-                                        &record.ddev_name,
-                                        &app_root,
-                                    ) {
-                                        Ok(_) => println!(
-                                            "DDEV: {} @ {} (running, {})",
-                                            project.name,
-                                            project.approot,
-                                            if project.mutagen_enabled {
-                                                "Mutagen ok"
-                                            } else {
-                                                "Mutagen disabled"
-                                            }
-                                        ),
-                                        Err(error) => {
-                                            println!("DDEV: NOT READY — {error}");
-                                            ready = false;
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    println!(
-                                        "DDEV: NOT READY — managed identity `{}` is not registered",
-                                        record.ddev_name
-                                    );
-                                    ready = false;
-                                }
-                                Err(error) => {
-                                    println!("DDEV: NOT READY — {error}");
-                                    ready = false;
-                                }
-                            }
-                        } else {
-                            println!("DDEV: READY to inspect");
-                        }
-                    }
-                    Err(error) => {
-                        println!("DDEV: NOT READY — {error}");
-                        ready = false;
-                    }
-                }
-            } else {
-                println!("DDEV: skipped (not configured)");
-            }
-            ready
+            Some(identity)
         }
         Err(error) => {
-            println!("Configuration: NOT READY — {error}");
-            false
+            println!("DDEV host: NOT READY — {error}");
+            ready = false;
+            None
         }
     };
-
-    if diagnostics.ready() && config_ready && ownership_issues.is_empty() {
-        println!("READY");
-        Ok(0)
-    } else {
-        println!(
-            "NOT READY — restore the reported repository or configuration state, then rerun doctor"
-        );
-        Ok(1)
-    }
-}
-
-fn ownership_state_for_path(
-    repository: &GitRepository,
-) -> (Option<(String, OwnershipRecord)>, Vec<String>) {
-    let entries = match state::list(&repository.common_dir) {
-        Ok(entries) => entries,
-        Err(error) => return (None, vec![error.to_string()]),
-    };
-    let mut issues = Vec::new();
-    let mut managed_record = None;
+    let entries = current_project_entries(state::list(&paths.host_root)?, &repository, &config);
     for entry in entries {
         match entry.record {
             Ok(record) => {
-                if Path::new(&record.common_directory) != repository.common_dir {
-                    issues.push(format!(
-                        "record `{}` points to another Git common directory",
-                        entry.name
-                    ));
-                } else if Path::new(&record.worktree_path) == repository.root {
-                    managed_record = Some((entry.name, record));
+                println!(
+                    "Workspace {}: {} — {}",
+                    record.workspace_name,
+                    record.status.label(),
+                    record.url
+                );
+                if !matches!(record.status, WorkspaceStatus::Ready) {
+                    ready = false;
+                }
+                if let Some(error) = &record.error {
+                    println!("  error: {error}");
+                    ready = false;
+                }
+                if matches!(record.status, WorkspaceStatus::Ready) {
+                    if let Some(identity) = host_identity.as_ref() {
+                        if let Err(error) = inspect_ready_record(
+                            &record,
+                            &repository,
+                            &config,
+                            &paths,
+                            identity,
+                            &mut runner,
+                        ) {
+                            println!("  NOT READY — {error}");
+                            ready = false;
+                        }
+                    } else {
+                        println!("  NOT READY — live host checks are unavailable");
+                        ready = false;
+                    }
+                } else if matches!(record.status, WorkspaceStatus::RetainedData)
+                    && let Some(identity) = host_identity.as_ref()
+                    && let Err(error) =
+                        inspect_retained_record(&record, &paths, identity, &mut runner)
+                {
+                    println!("  NOT READY — {error}");
+                    ready = false;
                 }
             }
-            Err(error) => issues.push(format!("record `{}` is invalid: {error}", entry.name)),
+            Err(error) => {
+                println!("Workspace {}: INVALID RECORD — {error}", entry.name);
+                ready = false;
+            }
         }
     }
-    (managed_record, issues)
-}
-
-fn list(_arguments: &ArgMatches) -> ToolResult<u8> {
-    let mut runner = RealCommandRunner::new(false);
-    let repository = GitRepository::discover(Path::new("."), &mut runner)?;
-    let manager_root = &repository.main_worktree;
-    let entries = state::list(&repository.common_dir)?;
-    if entries.is_empty() {
-        println!("No managed workspaces for {}", manager_root.display());
-        println!("READY — list complete");
-        return Ok(0);
-    }
-
-    let only_source_only = entries
-        .iter()
-        .all(|entry| entry.record.as_ref().is_ok_and(|record| record.source_only));
-    let config_result = ProjectConfig::load(manager_root).and_then(|config| {
-        if only_source_only {
-            config.validate_structure(manager_root, &mut runner)?;
-        } else {
-            config.validate(manager_root, &mut runner)?;
-        }
-        Ok(config)
-    });
-    let config = config_result.as_ref().ok();
-    let config_error = config_result
-        .as_ref()
-        .err()
-        .filter(|error| !error.to_string().starts_with("configuration is required"));
-    let needs_ddev_inspection = entries.iter().any(|entry| {
-        entry
-            .record
-            .as_ref()
-            .is_ok_and(|record| !record.source_only && record.ddev_app_root.is_some())
-    });
-    let ddev_inspection = needs_ddev_inspection.then(|| ddev::list(&mut runner, manager_root));
-    if let Some(Ok(inspection)) = &ddev_inspection {
-        for warning in &inspection.warnings {
-            println!("DDEV: {warning}");
-        }
-    }
-    let mut all_ready = true;
-    for entry in entries {
-        all_ready &= print_list_entry(
-            &repository,
-            config,
-            config_error,
-            ddev_inspection.as_ref(),
-            &entry,
-            &mut runner,
-        );
-    }
-    if all_ready {
-        println!("READY — list complete");
+    if ready {
+        println!("READY");
         Ok(0)
     } else {
-        println!("NOT READY — one or more managed workspaces require attention");
+        println!("NOT READY");
         Ok(1)
     }
 }
 
-fn print_list_entry<R: CommandRunner>(
+fn current_project_entries(
+    entries: Vec<state::RecordEntry>,
     repository: &GitRepository,
-    config: Option<&ProjectConfig>,
-    config_error: Option<&ToolError>,
-    ddev_inspection: Option<&Result<ddev::DdevInspection, ToolError>>,
-    entry: &RecordEntry,
-    runner: &mut R,
-) -> bool {
-    let record = match &entry.record {
-        Ok(record) => record,
-        Err(error) => {
-            println!("{}: INVALID RECORD — {error}", entry.name);
-            return false;
-        }
-    };
-    if Path::new(&record.common_directory) != repository.common_dir {
-        println!(
-            "{}: NOT READY — ownership record points to another Git common directory",
-            entry.name
-        );
-        return false;
-    }
-    if record.branch != entry.name {
-        println!(
-            "{}: INVALID RECORD — branch does not match the record filename",
-            entry.name
-        );
-        return false;
-    }
-    if !Path::new(&record.worktree_path).is_absolute() {
-        println!(
-            "{}: INVALID RECORD — worktree path must be absolute",
-            entry.name
-        );
-        return false;
-    }
-    if !git::is_full_commit_id(&record.base_sha) {
-        println!(
-            "{}: INVALID RECORD — base_sha is not a full commit ID",
-            entry.name
-        );
-        return false;
-    }
-    if let Some(error) = config_error {
-        println!(
-            "{}: NOT READY — current configuration is invalid: {error}",
-            entry.name
-        );
-        return false;
-    }
-    let path = PathBuf::from(&record.worktree_path);
-    if let Some(config) = config {
-        if record.project_id != config.project_id {
-            println!(
-                "{}: INVALID RECORD — project ID does not match current configuration",
-                entry.name
-            );
-            return false;
-        }
-        let expected_root =
-            match config::safe_join(&repository.main_worktree, &config.workspace_root) {
-                Ok(expected_root) => expected_root,
-                Err(error) => {
-                    println!("{}: NOT READY — {error}", entry.name);
-                    return false;
-                }
-            };
-        if path != expected_root.join(&entry.name) {
-            println!(
-                "{}: NOT READY — ownership record path does not match configured workspace path",
-                entry.name
-            );
-            return false;
-        }
-    }
-    if !path.exists() {
-        println!("{}: MISSING PATH — {}", entry.name, path.display());
-        return false;
-    }
-    let Ok(canonical) = fs::canonicalize(&path) else {
-        println!(
-            "{}: NOT READY — managed worktree path could not be canonicalized",
-            entry.name
-        );
-        return false;
-    };
-    if canonical != path {
-        println!(
-            "{}: NOT READY — managed worktree path is symlinked or otherwise non-canonical",
-            entry.name
-        );
-        return false;
-    }
-    let worktree_repository = match GitRepository::discover(&path, runner) {
-        Ok(repository) => repository,
-        Err(error) => {
-            println!("{}: NOT READY — {error}", entry.name);
-            return false;
-        }
-    };
-    if worktree_repository.common_dir != repository.common_dir {
-        println!(
-            "{}: NOT READY — managed path belongs to another Git common directory",
-            entry.name
-        );
-        return false;
-    }
-    let source = match worktree_repository.diagnose(None, runner) {
-        Ok(source) => source,
-        Err(error) => {
-            println!("{}: NOT READY — {error}", entry.name);
-            return false;
-        }
-    };
-    let Some(worktree) = source
-        .worktrees
-        .iter()
-        .find(|worktree| worktree.path == path)
-    else {
-        println!(
-            "{}: NOT READY — Git does not currently prove the recorded worktree path",
-            entry.name
-        );
-        return false;
-    };
-    if worktree.branch.as_deref() != Some(&format!("refs/heads/{}", entry.name)) {
-        println!(
-            "{}: NOT READY — Git worktree branch does not match the ownership record",
-            entry.name
-        );
-        return false;
-    }
-    if !source.ready() {
-        println!("{}: NOT READY — {}", entry.name, source.issues.join("; "));
-        return false;
-    }
-    if let Err(error) = worktree_repository.worktree_is_clean(&path, runner) {
-        println!("{}: NOT READY — {error}", entry.name);
-        return false;
-    }
-    if record.source_only {
-        if record.ddev_app_root.is_some() {
-            println!(
-                "{}: INVALID RECORD — source-only ownership cannot include a DDEV app root",
-                entry.name
-            );
-            return false;
-        }
-        println!(
-            "{}: SOURCE-ONLY — explicitly created without runtime preparation",
-            entry.name
-        );
-        return true;
-    }
-    let Some(config) = config else {
-        println!(
-            "{}: NOT READY — configuration is missing from the manager root",
-            entry.name
-        );
-        return false;
-    };
-    let expected_name = match ddev::expected_name(&config.project_id, &entry.name) {
-        Ok(expected_name) => expected_name,
-        Err(error) => {
-            println!("{}: NOT READY — {error}", entry.name);
-            return false;
-        }
-    };
-    if record.ddev_name != expected_name {
-        println!(
-            "{}: INVALID RECORD — DDEV name does not match the deterministic project identity",
-            entry.name
-        );
-        return false;
-    }
-    if let Some(reason) = runtime_precondition_failure(config, &path) {
-        println!("{}: NOT READY — {reason}", entry.name);
-        return false;
-    }
-    let current_ddev_app_root = match configured_ddev_app_root(config, &path, &entry.name, None) {
-        Ok(app_root) => app_root,
-        Err(error) => {
-            println!("{}: NOT READY — {error}", entry.name);
-            return false;
-        }
-    };
-    let recorded_matches = record
-        .ddev_app_root
-        .as_deref()
-        .map(|recorded| recorded_app_root(&path, recorded))
-        .transpose()
-        .is_ok_and(|recorded| recorded == current_ddev_app_root);
-    if !recorded_matches {
-        println!(
-            "{}: NOT READY — current DDEV app root differs from creation provenance",
-            entry.name
-        );
-        return false;
-    }
-    let Some(recorded_root) = &record.ddev_app_root else {
-        println!(
-            "{}: READY — source and configured non-DDEV checks pass",
-            entry.name
-        );
-        return true;
-    };
-    let app_root = match recorded_app_root(&path, recorded_root) {
-        Ok(app_root) => app_root,
-        Err(error) => {
-            println!("{}: NOT READY — {error}", entry.name);
-            return false;
-        }
-    };
-    let inspection = match ddev_inspection {
-        Some(Ok(inspection)) => inspection,
-        Some(Err(error)) => {
-            println!("{}: NOT READY — DDEV list failed: {error}", entry.name);
-            return false;
-        }
-        None => {
-            println!(
-                "{}: NOT READY — DDEV inspection was not prepared",
-                entry.name
-            );
-            return false;
-        }
-    };
-    match find_owned_ddev(&inspection.entries, &record.ddev_name, &app_root) {
-        Ok(Some(_))
-            if ddev::require_ready_identity(inspection, &record.ddev_name, &app_root).is_ok() =>
-        {
-            println!(
-                "{}: READY — running at {} (worktree {})",
-                entry.name,
-                app_root.display(),
-                path.display()
-            );
-            true
-        }
-        Ok(Some(_)) => {
-            println!(
-                "{}: NOT READY — DDEV identity is stopped or Mutagen is unhealthy",
-                entry.name
-            );
-            false
-        }
-        Ok(None) => {
-            println!(
-                "{}: NOT READY — DDEV identity is not registered",
-                entry.name
-            );
-            false
-        }
-        Err(error) => {
-            println!("{}: NOT READY — {error}", entry.name);
-            false
-        }
-    }
-}
-
-fn create(arguments: &ArgMatches) -> ToolResult<u8> {
-    let name = arguments
-        .get_one::<String>("name")
-        .map(String::as_str)
-        .ok_or_else(|| ToolError::usage("create requires a workspace name"))?;
-    config::validate_name("workspace name", name)?;
-    let dry_run = arguments.get_flag("dry-run");
-    let source_only = arguments.get_flag("source-only");
-    let requested_base = arguments.get_one::<String>("base").map(String::as_str);
-    let mut runner = RealCommandRunner::new(dry_run);
-    let repository = GitRepository::discover(Path::new("."), &mut runner)?;
-    let manager_root = repository.main_worktree.clone();
-    let project_config = ProjectConfig::load(&manager_root)?;
-    project_config.validate_structure(&manager_root, &mut runner)?;
-    let base = repository.resolve_base(requested_base, &mut runner)?;
-    let workspace_root = config::safe_join(&manager_root, &project_config.workspace_root)?;
-    let workspace = workspace_root.join(name);
-    ensure_workspace_path(&workspace_root, &workspace)?;
-    let ddev_name = ddev::expected_name(&project_config.project_id, name)?;
-    repository.ensure_worktree_available(&workspace, name, &mut runner)?;
-    if !source_only {
-        validate_local_file_sources(&project_config)?;
-        for file in &project_config.files {
-            if let Some(template) = &file.template {
-                repository.require_commit_regular_file(&base.sha, template, &mut runner)?;
+    config: &ProjectConfig,
+) -> Vec<state::RecordEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| match &entry.record {
+            Ok(record) => {
+                record.project_id == config.project_id
+                    && record.repository_root == repository.main_worktree.display().to_string()
             }
-        }
-    }
-
-    let resolved_source_site = if source_only {
-        None
-    } else {
-        project_config
-            .ddev
-            .as_ref()
-            .and_then(|ddev| ddev.source_site.as_ref())
-            .map(|source_site| config::resolve_source_site(&manager_root, source_site, !dry_run))
-            .transpose()?
-    };
-    let app_root = if source_only {
-        None
-    } else {
-        configured_ddev_app_root(
-            &project_config,
-            &workspace,
-            name,
-            resolved_source_site.as_ref(),
-        )?
-    };
-    if let Some(app_root) = &app_root {
-        let inspection = ddev::list(&mut runner, &manager_root)?;
-        ddev::inspect_new_identity(&inspection, &ddev_name, app_root)?;
-    }
-
-    println!("Repository: {}", project_config.project_id);
-    println!("Base: {} @ {}", base.reference, base.sha);
-    println!("Workspace: {}", workspace.display());
-    if dry_run {
-        print_create_dry_run(&project_config, &workspace, &base, &ddev_name, source_only);
-        return Ok(0);
-    }
-
-    let ddev_app_root = if source_only {
-        None
-    } else if let Some(ddev_config) = &project_config.ddev {
-        if ddev_config.source_site.is_some() {
-            Some(
-                app_root
-                    .as_ref()
-                    .ok_or_else(|| ToolError::new("configured source DDEV site root is missing"))?
-                    .display()
-                    .to_string(),
-            )
-        } else {
-            Some(ddev_config.app_root.clone())
-        }
-    } else {
-        None
-    };
-    let record = OwnershipRecord {
-        version: 1,
-        project_id: project_config.project_id.clone(),
-        common_directory: repository.common_dir.display().to_string(),
-        worktree_path: workspace.display().to_string(),
-        base_sha: base.sha.clone(),
-        branch: name.to_owned(),
-        ddev_name,
-        source_only,
-        source_site: resolved_source_site.is_some(),
-        ddev_app_root,
-    };
-    let record_path = state::reserve(&repository.common_dir, &record)?;
-    match create_after_reservation(
-        &repository,
-        &project_config,
-        &record,
-        &workspace,
-        &base,
-        resolved_source_site.as_ref(),
-        &mut runner,
-    ) {
-        Ok(()) => Ok(0),
-        Err(error) => Err(preserved_failure(error, &workspace, &record_path)),
-    }
+            Err(_) => true,
+        })
+        .collect()
 }
 
-fn create_after_reservation<R: CommandRunner>(
-    repository: &GitRepository,
-    project_config: &ProjectConfig,
+fn inspect_ready_record<R: CommandRunner>(
     record: &OwnershipRecord,
-    workspace: &Path,
-    base: &git::BaseRevision,
-    resolved_source_site: Option<&ResolvedSourceSite>,
+    repository: &GitRepository,
+    config: &ProjectConfig,
+    paths: &RuntimePaths,
+    identity: &HostIdentity,
     runner: &mut R,
 ) -> ToolResult<()> {
-    repository.add_worktree(workspace, &record.branch, &base.sha, runner)?;
-    let workspace_repository = GitRepository::discover(workspace, runner)?;
-    workspace_repository.initialize_submodules(runner)?;
-    workspace_repository.checkout_lfs(runner)?;
-    let source = workspace_repository.diagnose(Some(&base.sha), runner)?;
-    if !source.ready() {
-        return Err(ToolError::new(format_source_failure(&source)));
+    validate_record_identity(
+        record,
+        repository,
+        config,
+        paths,
+        identity,
+        &record.workspace_name,
+    )?;
+    let workspace = Path::new(&record.worktree_path);
+    if !workspace.is_dir() {
+        return Err(ToolError::new("recorded worktree is missing"));
     }
-    for warning in &source.warnings {
-        println!("Cleanup report: {warning}");
-    }
-    println!("Source: READY");
-    if record.source_only {
-        println!("Runtime: skipped by --source-only");
-        println!("DDEV: skipped by --source-only");
-        println!("READY — source-only workspace");
-        return Ok(());
-    }
-
-    prepare_files(project_config, workspace, &workspace_repository, runner)?;
-    if let Some(ddev_config) = &project_config.ddev {
-        let recorded = record
-            .ddev_app_root
-            .as_deref()
-            .ok_or_else(|| ToolError::new("DDEV ownership record has no app root"))?;
-        let app_root = recorded_app_root(workspace, recorded)?;
-        if let Some(source_site) = &ddev_config.source_site {
-            let resolved = resolved_source_site.ok_or_else(|| {
-                ToolError::new("source DDEV site paths were not resolved during creation preflight")
-            })?;
-            ddev::prepare_source_site(
-                workspace,
-                &app_root,
-                &resolved.generated_root,
-                &resolved.source_root,
-                &source_site.repository_path,
-            )?;
-        }
-        let inspection = ddev::list(runner, workspace)?;
-        ddev::inspect_new_identity(&inspection, &record.ddev_name, &app_root)?;
-        ddev::write_override(
-            &workspace_repository.root,
-            &app_root,
-            &record.ddev_name,
-            ddev_config.source_site.is_some(),
-            runner,
-        )?;
-        ddev::start(&app_root, runner)?;
-        if let Some(source_site) = &ddev_config.source_site
-            && source_site.clone_database
-        {
-            let source_root = &resolved_source_site
-                .ok_or_else(|| ToolError::new("source DDEV site paths are unavailable"))?
-                .source_root;
-            ddev::clone_database(source_root, &app_root, runner)?;
-        }
-        let after_start = ddev::list(runner, &app_root)?;
-        ddev::require_ready_identity(&after_start, &record.ddev_name, &app_root)?;
-    }
-    for command in &project_config.commands {
-        run_one_command(command, workspace, runner)?;
-    }
-    let source = workspace_repository.diagnose(Some(&base.sha), runner)?;
-    if !source.ready() {
-        return Err(ToolError::new(format_source_failure(&source)));
-    }
-    workspace_repository.worktree_is_clean(workspace, runner)?;
-    for warning in &source.warnings {
-        println!("Cleanup report: {warning}");
-    }
-    let ddev_project = if project_config.ddev.is_some() {
-        let recorded = record
-            .ddev_app_root
-            .as_deref()
-            .ok_or_else(|| ToolError::new("DDEV ownership record has no app root"))?;
-        let app_root = recorded_app_root(workspace, recorded)?;
-        let after_commands = ddev::list(runner, &app_root)?;
-        Some(ddev::require_ready_identity(
-            &after_commands,
-            &record.ddev_name,
-            &app_root,
-        )?)
+    let prepared = prepared_from_record(config, paths, workspace, record, false)?;
+    ensure_route_target_is_safe(config, &prepared.route_target, workspace, &paths.host_root)?;
+    let link = Path::new(&record.paths.link);
+    let target = ddev::link_target(link)
+        .map_err(|error| ToolError::new(format!("recorded route link is unavailable: {error}")))?;
+    let resolved_target = if target.is_absolute() {
+        target
     } else {
-        None
+        link.parent()
+            .ok_or_else(|| ToolError::new("recorded route link has no parent"))?
+            .join(target)
     };
-    if let Some(reason) = runtime_precondition_failure(project_config, workspace) {
+    if fs::canonicalize(resolved_target)? != fs::canonicalize(&prepared.route_target)? {
+        return Err(ToolError::new(
+            "recorded route link points to a different runtime target",
+        ));
+    }
+    let database = DatabaseContext::from_host(&paths.host_root, identity, config)?;
+    if !database.exists(&record.database.name, runner)? {
         return Err(ToolError::new(format!(
-            "runtime readiness failed after declared commands: {reason}"
+            "recorded workspace database {} is missing",
+            record.database.name
         )));
     }
-
-    println!("Runtime: READY");
-    if let Some(project) = ddev_project {
-        println!(
-            "DDEV: {} @ {} (running, {})",
-            project.name,
-            project.approot,
-            if project.mutagen_enabled {
-                "Mutagen ok"
-            } else {
-                "Mutagen disabled"
-            }
-        );
-    } else {
-        println!("DDEV: skipped (not configured)");
+    let ownership_token =
+        record.database.ownership_token.as_deref().ok_or_else(|| {
+            ToolError::new("recorded workspace database ownership token is missing")
+        })?;
+    if !database.owns(&record.database.name, ownership_token, runner)? {
+        return Err(ToolError::new(format!(
+            "recorded workspace database {} is missing its ownership marker",
+            record.database.name
+        )));
     }
-    println!("READY");
     Ok(())
 }
 
-fn remove(arguments: &ArgMatches) -> ToolResult<u8> {
-    let name = arguments
-        .get_one::<String>("name")
-        .map(String::as_str)
-        .ok_or_else(|| ToolError::usage("remove requires a workspace name"))?;
-    config::validate_name("workspace name", name)?;
-    let dry_run = arguments.get_flag("dry-run");
-    let delete_data = arguments.get_flag("delete-ddev-data");
-    let yes = arguments.get_flag("yes");
-    let mut runner = RealCommandRunner::new(false);
-    let repository = GitRepository::discover(Path::new("."), &mut runner)?;
-    let manager_root = repository.main_worktree.clone();
-    let project_config = ProjectConfig::load(&manager_root)?;
-    let (record_path, record) = state::load(&repository.common_dir, name)?;
-    if record.source_only {
-        project_config.validate_structure(&manager_root, &mut runner)?;
-    } else {
-        project_config.validate(&manager_root, &mut runner)?;
+fn inspect_retained_record<R: CommandRunner>(
+    record: &OwnershipRecord,
+    paths: &RuntimePaths,
+    identity: &HostIdentity,
+    runner: &mut R,
+) -> ToolResult<()> {
+    validate_retained_record(record, paths)?;
+    let database = DatabaseContext::from_host_source(
+        &paths.host_root,
+        identity,
+        record.database.source.as_deref(),
+    )?;
+    if !database.exists(&record.database.name, runner)? {
+        return Err(ToolError::new(format!(
+            "retained workspace database {} is missing",
+            record.database.name
+        )));
     }
-    let target = verify_removal_target(&repository, &project_config, name, &record, &mut runner)?;
+    let ownership_token =
+        record.database.ownership_token.as_deref().ok_or_else(|| {
+            ToolError::new("retained workspace database ownership token is missing")
+        })?;
+    if !database.owns(&record.database.name, ownership_token, runner)? {
+        return Err(ToolError::new(format!(
+            "retained workspace database {} is missing its ownership marker",
+            record.database.name
+        )));
+    }
+    Ok(())
+}
 
-    println!("Will remove managed worktree {}.", target.path.display());
-    if target.generated_app_root
-        && let Some(app_root) = &target.app_root
-    {
-        println!(
-            "Will recursively remove generated DDEV application {}.",
-            app_root.display()
-        );
-    }
-    if target.ddev.is_some() {
-        if delete_data {
-            println!(
-                "Will stop, remove data, and unlist DDEV project {}.",
-                record.ddev_name
-            );
-        } else {
-            println!("Will stop and unlist DDEV project {}.", record.ddev_name);
-        }
-    }
-    println!("Will retain branch {}.", record.branch);
-    if delete_data && target.ddev.is_none() {
+fn load_project<R: CommandRunner>(
+    path: &Path,
+    runner: &mut R,
+) -> ToolResult<(GitRepository, ProjectConfig, RuntimePaths)> {
+    let repository = GitRepository::discover(path, runner)?;
+    let config = ProjectConfig::load(&repository.main_worktree)?;
+    let paths = config.validate(&repository.main_worktree, runner)?;
+    Ok((repository, config, paths))
+}
+
+fn require_main_repository(repository: &GitRepository) -> ToolResult<()> {
+    if repository.root != repository.main_worktree {
         return Err(ToolError::new(
-            "--delete-ddev-data was requested but the exact owned DDEV identity is absent",
+            "workspace lifecycle commands must run from the main checkout; use doctor PATH for a managed worktree",
         ));
     }
-    if dry_run {
-        println!("DRY RUN — no DDEV, Git, file, or ownership mutation performed");
-        println!("READY — removal preflight complete");
-        return Ok(0);
-    }
+    Ok(())
+}
 
-    require_removal_confirmation(name, delete_data, yes)?;
-
-    let (_, current_config, current_record) = reload_removal_state(
-        &repository,
-        name,
-        &project_config,
-        &record,
-        &record_path,
-        &mut runner,
-    )?;
-    let current = verify_removal_target(
-        &repository,
-        &current_config,
-        name,
-        &current_record,
-        &mut runner,
-    )?;
-    if let (Some(_), Some(app_root)) = (&current.ddev, &current.app_root) {
-        ddev::stop_unlist(
-            app_root,
-            &current_record.ddev_name,
-            delete_data,
-            &mut runner,
-        )?;
-    }
-    let (latest_record_path, latest_config, latest_record) = reload_removal_state(
-        &repository,
-        name,
-        &project_config,
-        &record,
-        &record_path,
-        &mut runner,
-    )?;
-    let second_check = verify_removal_target(
-        &repository,
-        &latest_config,
-        name,
-        &latest_record,
-        &mut runner,
-    )?;
-    if second_check.generated_app_root
-        && let Some(app_root) = &second_check.app_root
-    {
-        match fs::symlink_metadata(app_root) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                fs::remove_dir_all(app_root).map_err(|error| {
-                    ToolError::new(format!(
-                        "cannot remove owned generated DDEV app root {}: {error}",
-                        app_root.display()
-                    ))
-                })?;
+fn resolve_resource_key(
+    host_root: &Path,
+    config: &ProjectConfig,
+    workspace_name: &str,
+) -> ToolResult<String> {
+    let base = config::resource_key(&config.project_id, workspace_name);
+    let entries = state::list(host_root)?;
+    if let Some(entry) = entries.iter().find(|entry| entry.name == base) {
+        match &entry.record {
+            Ok(record)
+                if record.project_id == config.project_id
+                    && record.workspace_name == workspace_name =>
+            {
+                return Ok(base);
             }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(ToolError::new(format!(
+                    "resource key {} has an invalid ownership record: {error}; repair it manually",
+                    base
+                )));
+            }
+        }
+    } else {
+        let suffix = config::identity_hash(&config.project_id, workspace_name);
+        let candidate = format!("{base}-{suffix}");
+        if let Some(entry) = entries.iter().find(|entry| entry.name == candidate) {
+            match &entry.record {
+                Ok(record)
+                    if record.project_id == config.project_id
+                        && record.workspace_name == workspace_name =>
+                {
+                    return Ok(candidate);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(ToolError::new(format!(
+                        "resource key {} has an invalid ownership record: {error}; repair it manually",
+                        candidate
+                    )));
+                }
+            }
+            return Err(ToolError::new(format!(
+                "resource key collision remains after identity hashing: {candidate}; repair the host records manually"
+            )));
+        }
+        return Ok(base);
+    }
+    let suffix = config::identity_hash(&config.project_id, workspace_name);
+    let candidate = format!("{base}-{suffix}");
+    if let Some(entry) = entries.iter().find(|entry| entry.name == candidate) {
+        match &entry.record {
+            Ok(record)
+                if record.project_id == config.project_id
+                    && record.workspace_name == workspace_name =>
+            {
+                return Ok(candidate);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(ToolError::new(format!(
+                    "resource key collision remains after identity hashing: {candidate} has an invalid ownership record: {error}; repair it manually"
+                )));
+            }
+        }
+        return Err(ToolError::new(format!(
+            "resource key collision remains after identity hashing: {candidate}; repair the host records manually"
+        )));
+    }
+    Ok(candidate)
+}
+
+fn existing_record(
+    host_root: &Path,
+    config: &ProjectConfig,
+    workspace_name: &str,
+) -> ToolResult<Option<(PathBuf, OwnershipRecord)>> {
+    let entries = state::list(host_root)?;
+    let matches = entries
+        .into_iter()
+        .filter_map(|entry| match entry.record {
+            Ok(record)
+                if record.project_id == config.project_id
+                    && record.workspace_name == workspace_name =>
+            {
+                Some(Ok((state::record_path(host_root, &entry.name), record)))
+            }
+            Err(error)
+                if entry.name == config::resource_key(&config.project_id, workspace_name) =>
+            {
+                Some(Err(ToolError::new(format!(
+                    "matching ownership record {} is invalid: {error}",
+                    entry.name
+                ))))
+            }
+            _ => None,
+        })
+        .collect::<Result<Vec<_>, ToolError>>()?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err(ToolError::new(
+            "multiple ownership records match the workspace identity; resolve them manually",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_record(
+    repository: &GitRepository,
+    config: &ProjectConfig,
+    paths: &RuntimePaths,
+    identity: &HostIdentity,
+    workspace_name: &str,
+    resource_key: &str,
+    base: &git::BaseRevision,
+    database_mode: DatabaseMode,
+    database_name: &str,
+) -> ToolResult<OwnershipRecord> {
+    let url = ddev::expected_url(&identity.hostname, resource_key)?;
+    let ownership_token = database_ownership_token(config, workspace_name)?;
+    Ok(OwnershipRecord {
+        version: RECORD_VERSION,
+        project_id: config.project_id.clone(),
+        workspace_name: workspace_name.to_owned(),
+        resource_key: resource_key.to_owned(),
+        adapter: config.runtime.adapter.clone(),
+        repository_root: repository.main_worktree.display().to_string(),
+        common_directory: repository.common_dir.display().to_string(),
+        host_root: paths.host_root.display().to_string(),
+        worktree_path: paths.worktree_root.join(resource_key).display().to_string(),
+        base_sha: base.sha.clone(),
+        branch: workspace_name.to_owned(),
+        hostname: ddev::expected_hostname(&identity.hostname, resource_key)?,
+        url,
+        database: DatabaseRecord {
+            name: database_name.to_owned(),
+            provenance: match database_mode {
+                DatabaseMode::Copy => DatabaseProvenance::Copy,
+                DatabaseMode::Fresh => DatabaseProvenance::Fresh,
+            },
+            prepared: false,
+            ownership_token: Some(ownership_token),
+            source: match database_mode {
+                DatabaseMode::Copy => Some(
+                    config
+                        .database
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "db".to_owned()),
+                ),
+                DatabaseMode::Fresh => None,
+            },
+        },
+        paths: OwnedPaths {
+            link: state::links_directory(&paths.host_root)
+                .join(resource_key)
+                .display()
+                .to_string(),
+            view: None,
+            files: Vec::new(),
+            writable: Vec::new(),
+        },
+        status: WorkspaceStatus::Creating,
+        error: None,
+    })
+}
+
+fn database_name(resource_key: &str) -> ToolResult<String> {
+    let name = if resource_key.len() <= 57 {
+        format!("dw_{}", resource_key.replace('-', "_"))
+    } else {
+        let prefix = &resource_key[..48];
+        let suffix = &resource_key[resource_key.len().saturating_sub(8)..];
+        format!("dw_{}_{}", prefix.replace('-', "_"), suffix)
+    };
+    config::validate_database_name("workspace database", &name)?;
+    Ok(name)
+}
+
+fn ensure_unclaimed_runtime_paths(
+    config: &ProjectConfig,
+    paths: &RuntimePaths,
+    resource_key: &str,
+) -> ToolResult<()> {
+    let link = state::links_directory(&paths.host_root).join(resource_key);
+    match fs::symlink_metadata(&link) {
+        Ok(_) => {
+            return Err(ToolError::new(format!(
+                "workspace route {} already exists without a resumable ownership record; refusing to adopt it",
+                link.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if config.runtime.adapter == "wordpress-component" {
+        let view = state::views_directory(&paths.host_root).join(resource_key);
+        match fs::symlink_metadata(&view) {
             Ok(_) => {
                 return Err(ToolError::new(format!(
-                    "owned generated DDEV app root {} is not a regular directory; refusing removal",
-                    app_root.display()
+                    "WordPress generated view {} already exists without a resumable ownership record; refusing to adopt it",
+                    view.display()
                 )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
     }
-    repository.remove_worktree(&second_check.path, &mut runner)?;
-    state::delete(&latest_record_path)?;
-    println!("READY — managed workspace removed; branch retained");
-    Ok(0)
+    Ok(())
 }
 
-#[derive(Debug)]
-struct RemovalTarget {
-    path: PathBuf,
-    ddev: Option<DdevProject>,
-    app_root: Option<PathBuf>,
-    generated_app_root: bool,
+fn database_ownership_token(config: &ProjectConfig, workspace_name: &str) -> ToolResult<String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ToolError::new(format!("system clock error: {error}")))?
+        .as_nanos();
+    Ok(format!(
+        "{}-{nonce:x}",
+        config::identity_hash(&config.project_id, workspace_name)
+    ))
 }
 
-fn reload_removal_state<R: CommandRunner>(
-    repository: &GitRepository,
-    name: &str,
-    expected_config: &ProjectConfig,
-    expected_record: &OwnershipRecord,
-    expected_record_path: &Path,
-    runner: &mut R,
-) -> ToolResult<(PathBuf, ProjectConfig, OwnershipRecord)> {
-    let config = ProjectConfig::load(&repository.main_worktree)?;
-    if expected_record.source_only {
-        config.validate_structure(&repository.main_worktree, runner)?;
-    } else {
-        config.validate(&repository.main_worktree, runner)?;
+fn database_mode_from_record(record: &OwnershipRecord) -> DatabaseMode {
+    match record.database.provenance {
+        DatabaseProvenance::Copy => DatabaseMode::Copy,
+        DatabaseProvenance::Fresh => DatabaseMode::Fresh,
     }
-    let (record_path, record) = state::load(&repository.common_dir, name)?;
-    if record_path != expected_record_path
-        || &record != expected_record
-        || &config != expected_config
+}
+
+fn validate_record_identity(
+    record: &OwnershipRecord,
+    repository: &GitRepository,
+    config: &ProjectConfig,
+    paths: &RuntimePaths,
+    identity: &HostIdentity,
+    workspace_name: &str,
+) -> ToolResult<()> {
+    if record.version != RECORD_VERSION
+        || record.project_id != config.project_id
+        || record.workspace_name != workspace_name
+        || record.repository_root != repository.main_worktree.display().to_string()
+        || record.common_directory != repository.common_dir.display().to_string()
+        || record.host_root != paths.host_root.display().to_string()
+        || record.adapter != config.runtime.adapter
+        || record.branch != workspace_name
     {
         return Err(ToolError::new(
-            "ownership record or project configuration changed after confirmation; no further mutation was attempted",
+            "ownership record identity does not match the current repository, host, adapter, or workspace name",
         ));
     }
-    Ok((record_path, config, record))
-}
-
-fn verify_removal_target<R: CommandRunner>(
-    repository: &GitRepository,
-    project_config: &ProjectConfig,
-    name: &str,
-    record: &OwnershipRecord,
-    runner: &mut R,
-) -> ToolResult<RemovalTarget> {
-    if record.version != 1 {
+    let expected_key = config::resource_key(&config.project_id, workspace_name);
+    let hashed_key = format!(
+        "{}-{}",
+        expected_key,
+        config::identity_hash(&config.project_id, workspace_name)
+    );
+    if record.resource_key != expected_key && record.resource_key != hashed_key {
         return Err(ToolError::new(
-            "ownership record version is unsupported; refusing removal",
+            "ownership record resource key does not match the deterministic workspace identity",
         ));
     }
-    if record.project_id != project_config.project_id {
+    let expected_database = database_name(&record.resource_key)?;
+    if record.database.name != expected_database {
         return Err(ToolError::new(
-            "ownership record project ID differs from current configuration; refusing removal",
+            "ownership record database name does not match the deterministic resource key",
         ));
     }
-    if Path::new(&record.common_directory) != repository.common_dir {
+    let expected_link = state::links_directory(&paths.host_root).join(&record.resource_key);
+    if Path::new(&record.paths.link) != expected_link {
         return Err(ToolError::new(
-            "ownership record points to a different Git common directory; refusing removal",
+            "ownership record route link does not match the host-local resource identity",
         ));
     }
-    if record.branch != name {
-        return Err(ToolError::new(
-            "ownership record branch does not match the requested workspace name; refusing removal",
-        ));
-    }
-    if !git::is_full_commit_id(&record.base_sha) {
-        return Err(ToolError::new(
-            "ownership record base SHA is not a full commit ID; refusing removal",
-        ));
-    }
-    let expected_ddev_name = ddev::expected_name(&project_config.project_id, name)?;
-    if record.ddev_name != expected_ddev_name {
-        return Err(ToolError::new(
-            "ownership record DDEV name does not match the deterministic project identity; refusing removal",
-        ));
-    }
-    let workspace_root =
-        config::safe_join(&repository.main_worktree, &project_config.workspace_root)?;
-    let expected_path = workspace_root.join(name);
-    let path = PathBuf::from(&record.worktree_path);
-    if path != expected_path {
-        return Err(ToolError::new(format!(
-            "ownership record path {} does not match configured workspace path {}; refusing removal",
-            path.display(),
-            expected_path.display()
-        )));
-    }
-    if path == repository.main_worktree {
-        return Err(ToolError::new("the main Git worktree is never removable"));
-    }
-    if !path.exists() {
-        return Err(ToolError::new(format!(
-            "managed worktree {} is missing; ownership is not re-created automatically",
-            path.display()
-        )));
-    }
-    let canonical = fs::canonicalize(&path)?;
-    if canonical != path {
-        return Err(ToolError::new(
-            "managed worktree path is symlinked or otherwise non-canonical; refusing removal",
-        ));
-    }
-    let worktrees = repository.worktrees(runner)?;
-    let Some(worktree) = worktrees.iter().find(|worktree| worktree.path == path) else {
-        return Err(ToolError::new(
-            "Git does not currently prove the owned worktree path; refusing removal",
-        ));
-    };
-    if worktree.locked {
-        return Err(ToolError::new(
-            "managed Git worktree is locked; unlock it manually before removal",
-        ));
-    }
-    if worktree.prunable {
-        return Err(ToolError::new(
-            "managed Git worktree metadata is prunable; repair it manually before removal",
-        ));
-    }
-    if worktree.branch.as_deref() != Some(&format!("refs/heads/{name}")) {
-        return Err(ToolError::new(
-            "Git worktree branch does not match the ownership record; refusing removal",
-        ));
-    }
-    repository.worktree_is_clean(&path, runner)?;
-
-    if record.source_only && record.ddev_app_root.is_some() {
-        return Err(ToolError::new(
-            "source-only ownership record unexpectedly includes a DDEV app root; refusing removal",
-        ));
-    }
-    let configured_source_site = project_config
-        .ddev
-        .as_ref()
-        .is_some_and(|ddev_config| ddev_config.source_site.is_some());
-    let recorded_source_site = record.uses_source_site();
-    if !record.source_only && recorded_source_site != configured_source_site {
-        return Err(ToolError::new(
-            "current DDEV mode differs from creation provenance; restore the source-site configuration before removal",
-        ));
-    }
-    if !record.source_only && configured_source_site {
-        let configured_app_root = configured_ddev_app_root(project_config, &path, name, None)?;
-        let owned_app_root = record
-            .ddev_app_root
-            .as_deref()
-            .map(|recorded| recorded_app_root(&path, recorded))
-            .transpose()?;
-        if owned_app_root != configured_app_root {
+    match record.database.provenance {
+        DatabaseProvenance::Copy => {
+            let expected_source = config.database.source.as_deref().unwrap_or("db");
+            if record.database.source.as_deref().unwrap_or("db") != expected_source {
+                return Err(ToolError::new(
+                    "ownership record database source does not match the current configuration",
+                ));
+            }
+        }
+        DatabaseProvenance::Fresh if record.database.source.is_some() => {
             return Err(ToolError::new(
-                "owned generated DDEV app root differs from the current configuration; refusing removal",
+                "fresh ownership record unexpectedly contains a source database",
             ));
         }
+        DatabaseProvenance::Fresh => {}
     }
-    let (ddev, app_root) = if let Some(recorded_root) = &record.ddev_app_root {
-        let app_root = recorded_app_root(&path, recorded_root)?;
-        if recorded_source_site && !app_root.exists() {
-            (None, Some(app_root))
-        } else {
-            let inspection = ddev::list(runner, &app_root)?;
-            (
-                find_owned_ddev(&inspection.entries, &record.ddev_name, &app_root)?,
-                Some(app_root),
-            )
-        }
-    } else {
-        (None, None)
-    };
-    Ok(RemovalTarget {
-        path,
-        ddev,
-        app_root,
-        generated_app_root: recorded_source_site,
-    })
+    let expected_hostname = ddev::expected_hostname(&identity.hostname, &record.resource_key)?;
+    if record.hostname != expected_hostname {
+        return Err(ToolError::new(
+            "ownership record hostname does not match the current shared host identity",
+        ));
+    }
+    let expected_worktree = paths.worktree_root.join(&record.resource_key);
+    if Path::new(&record.worktree_path) != expected_worktree {
+        return Err(ToolError::new(
+            "ownership record worktree path does not match the configured worktree root",
+        ));
+    }
+    Ok(())
 }
 
-fn find_owned_ddev(
-    entries: &[DdevProject],
-    expected_name: &str,
-    app_root: &Path,
-) -> ToolResult<Option<DdevProject>> {
-    let expected_path = fs::canonicalize(app_root).unwrap_or_else(|_| app_root.to_path_buf());
-    let mut exact = Vec::new();
-    for entry in entries {
-        let entry_path =
-            fs::canonicalize(&entry.approot).unwrap_or_else(|_| PathBuf::from(&entry.approot));
-        if entry.name == expected_name {
-            if entry_path != expected_path {
-                return Err(ToolError::new(format!(
-                    "DDEV project `{expected_name}` is registered to {}; refusing cross-project cleanup",
-                    entry.approot
-                )));
-            }
-            exact.push(entry.clone());
-        } else if entry_path == expected_path {
-            return Err(ToolError::new(format!(
-                "DDEV app root {} is registered under unexpected name `{}`; refusing cleanup",
-                app_root.display(),
-                entry.name
-            )));
-        }
+fn validate_retained_record(record: &OwnershipRecord, paths: &RuntimePaths) -> ToolResult<()> {
+    if !record.database.prepared
+        || !matches!(record.database.provenance, DatabaseProvenance::Copy)
+        || record.database.source.is_none()
+        || record.database.ownership_token.is_none()
+        || record.paths.view.is_some()
+        || !record.paths.files.is_empty()
+        || !record.paths.writable.is_empty()
+    {
+        return Err(ToolError::new(
+            "retained-data ownership record is incomplete or has runtime paths; inspect it manually before deleting the database",
+        ));
     }
-    match exact.len() {
-        0 => Ok(None),
-        1 => Ok(exact.into_iter().next()),
-        _ => Err(ToolError::new(format!(
-            "DDEV project `{expected_name}` has duplicate registrations; refusing cleanup"
+    let expected_link = state::links_directory(&paths.host_root).join(&record.resource_key);
+    if Path::new(&record.paths.link) != expected_link {
+        return Err(ToolError::new(
+            "retained-data ownership record route link is outside the host-local links directory",
+        ));
+    }
+    match fs::symlink_metadata(&record.paths.link) {
+        Ok(_) => {
+            return Err(ToolError::new(
+                "retained-data ownership record still has a route link; inspect and remove the route manually before deleting the database",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::symlink_metadata(&record.worktree_path) {
+        Ok(_) => Err(ToolError::new(
+            "retained-data ownership record still has a worktree; inspect it manually before deleting the database",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_route_target_is_safe(
+    config: &ProjectConfig,
+    route_target: &Path,
+    workspace: &Path,
+    host_root: &Path,
+) -> ToolResult<()> {
+    runtime::ensure_tree_within(route_target, host_root)?;
+    if config.runtime.adapter == "laravel"
+        && matches!(
+            fs::symlink_metadata(workspace),
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink()
+        )
+    {
+        runtime::ensure_tree_within(route_target, workspace)?;
+    } else if config.runtime.adapter == "wordpress-component" {
+        runtime::wordpress::ensure_selected_component_is_safe(config, route_target, workspace)?;
+    }
+    Ok(())
+}
+
+fn prepare_adapter(
+    config: &ProjectConfig,
+    paths: &RuntimePaths,
+    workspace: &Path,
+    resource_key: &str,
+    database: &str,
+    url: &str,
+) -> ToolResult<PreparedRuntime> {
+    match config.runtime.adapter.as_str() {
+        "laravel" => runtime::laravel::prepare(config, paths, workspace, database, url),
+        "wordpress-component" => {
+            runtime::wordpress::prepare(config, paths, workspace, resource_key, database, url)
+        }
+        adapter => Err(ToolError::new(format!(
+            "unsupported runtime adapter {adapter}"
         ))),
     }
 }
 
-fn runtime_precondition_failure(config: &ProjectConfig, workspace: &Path) -> Option<String> {
-    for file in &config.files {
-        let destination = match config::safe_join(workspace, &file.destination) {
-            Ok(destination) => destination,
-            Err(error) => return Some(error.to_string()),
-        };
-        if !is_regular_file(&destination) {
-            return Some(format!(
-                "file rule `{}` has not materialized regular destination {}",
-                file.label,
-                destination.display()
-            ));
-        }
+fn laravel_runtime_needs_prepare(record: &OwnershipRecord) -> ToolResult<bool> {
+    if record.paths.view.is_some() {
+        return Err(ToolError::new(
+            "Laravel ownership record unexpectedly contains a generated view",
+        ));
     }
-    for check in &config.checks {
-        if let Err(error) = run_one_check(check, workspace) {
-            return Some(error.to_string());
-        }
-    }
-    None
-}
-
-fn prepare_files<R: CommandRunner>(
-    project_config: &ProjectConfig,
-    workspace: &Path,
-    workspace_repository: &GitRepository,
-    runner: &mut R,
-) -> ToolResult<()> {
-    let mut planned = Vec::new();
-    for file in &project_config.files {
-        let destination = config::safe_join(workspace, &file.destination)?;
-        if fs::symlink_metadata(&destination).is_ok() {
-            return Err(ToolError::new(format!(
-                "file rule `{}` refuses to overwrite existing destination {}",
-                file.label,
-                destination.display()
-            )));
-        }
-        if !config::is_ignored(&workspace_repository.root, &destination, runner)? {
-            return Err(ToolError::new(format!(
-                "file rule `{}` destination {} is not ignored by Git; add an ignore rule manually",
-                file.label,
-                destination.display()
-            )));
-        }
-        let source = match (&file.template, &file.source_env) {
-            (Some(template), None) => {
-                let path = config::safe_join(workspace, template)?;
-                workspace_repository.require_stage_zero_file(&path, runner)?;
-                ensure_regular_file(&path, &file.label)?;
-                path
-            }
-            (None, Some(source_env)) => config::source_from_environment(source_env)?,
-            _ => {
+    let mut materialized = false;
+    let mut missing = false;
+    for path in &record.paths.files {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(ToolError::new(format!(
-                    "file rule `{}` has no unique source",
-                    file.label
+                    "recorded Laravel generated file {} is not a regular file",
+                    path
                 )));
             }
-        };
-        planned.push((file, source, destination));
-    }
-
-    for (file, source, destination) in planned {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+            Ok(_) => materialized = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(error) => return Err(error.into()),
         }
-        copy_file_atomically(
-            &source,
-            &destination,
-            &file.label,
-            file.source_env.is_some(),
-        )?;
+    }
+    for path in &record.paths.writable {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(ToolError::new(format!(
+                    "recorded Laravel writable path {} is not a regular directory",
+                    path
+                )));
+            }
+            Ok(_) => materialized = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if missing && materialized {
+        return Err(ToolError::new(
+            "Laravel runtime preparation is incomplete; inspect the recorded generated paths before retrying",
+        ));
+    }
+    Ok(missing
+        || (!materialized && record.paths.files.is_empty() && record.paths.writable.is_empty()))
+}
+
+fn prepared_from_record(
+    config: &ProjectConfig,
+    paths: &RuntimePaths,
+    workspace: &Path,
+    record: &OwnershipRecord,
+    allow_missing_route_target: bool,
+) -> ToolResult<PreparedRuntime> {
+    let expected_link = state::links_directory(&paths.host_root).join(&record.resource_key);
+    if Path::new(&record.paths.link) != expected_link {
+        return Err(ToolError::new(
+            "recorded route link is outside the host-local links directory",
+        ));
+    }
+    let route_target = if let Some(view) = &record.paths.view {
+        let expected_view = state::views_directory(&paths.host_root).join(&record.resource_key);
+        if Path::new(view) != expected_view {
+            return Err(ToolError::new(
+                "recorded generated view does not match the resource key",
+            ));
+        }
+        PathBuf::from(view)
+    } else {
+        let docroot = config.runtime.docroot.as_deref().unwrap_or(".");
+        if allow_missing_route_target && !workspace.exists() {
+            config::validate_repository_relative("runtime.docroot", docroot)?;
+            workspace.join(config::normalize_relative_path(docroot))
+        } else {
+            config::safe_join(workspace, docroot)?
+        }
+    };
+    validate_owned_path(&route_target, &paths.host_root, allow_missing_route_target)?;
+    if config.runtime.adapter == "wordpress-component"
+        && record.paths.view.is_some()
+        && matches!(fs::symlink_metadata(&route_target), Ok(metadata) if metadata.is_dir())
+    {
+        if !runtime::wordpress::view_is_owned(&route_target, &record.resource_key)? {
+            return Err(ToolError::new(format!(
+                "recorded WordPress generated view {} is not proven workspace-owned; inspect it manually",
+                route_target.display()
+            )));
+        }
+        if matches!(
+            fs::symlink_metadata(workspace),
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink()
+        ) && !runtime::wordpress::selected_component_is_owned(config, &route_target, workspace)?
+        {
+            return Err(ToolError::new(format!(
+                "recorded WordPress generated view {} does not point at the recorded worktree component; inspect it manually",
+                route_target.display()
+            )));
+        }
+    }
+    match fs::symlink_metadata(&route_target) {
+        Ok(route_metadata) => {
+            if route_metadata.file_type().is_symlink() || !route_metadata.is_dir() {
+                return Err(ToolError::new(format!(
+                    "recorded route target {} is missing; inspect the ownership record manually",
+                    route_target.display()
+                )));
+            }
+        }
+        Err(error)
+            if allow_missing_route_target && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ToolError::new(format!(
+                "recorded route target {} cannot be inspected: {error}",
+                route_target.display()
+            )));
+        }
+    }
+    if fs::symlink_metadata(&route_target).is_ok() {
+        ensure_route_target_is_safe(config, &route_target, workspace, &paths.host_root)?;
+    }
+    let files = record
+        .paths
+        .files
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let writable = record
+        .paths
+        .writable
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if config.runtime.adapter == "laravel" {
+        runtime::laravel::validate_recorded_paths(config, paths, workspace, &files, &writable)?;
+    } else if config.runtime.adapter == "wordpress-component" {
+        runtime::wordpress::validate_recorded_paths(&route_target, &files, &writable)?;
+    }
+    let allowed_writable = if config.runtime.adapter == "laravel" {
+        runtime::laravel::configured_writable_paths(config, workspace)?
+    } else {
+        writable.clone()
+    };
+    let owner_root = record
+        .paths
+        .view
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.to_path_buf());
+    for path in files.iter().chain(writable.iter()) {
+        validate_owned_path(path, &owner_root, allow_missing_route_target)?;
+    }
+    Ok(PreparedRuntime {
+        route_target,
+        view: record.paths.view.as_deref().map(PathBuf::from),
+        files,
+        writable,
+        allowed_writable,
+    })
+}
+
+fn validate_owned_path(path: &Path, owner_root: &Path, allow_missing: bool) -> ToolResult<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        || !path.starts_with(owner_root)
+    {
+        return Err(ToolError::new(
+            "recorded generated paths escape their workspace or generated view",
+        ));
+    }
+    let root_metadata = match fs::symlink_metadata(owner_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !allow_missing {
+                return Err(ToolError::new(format!(
+                    "recorded generated path {} is missing; inspect the ownership record manually",
+                    path.display()
+                )));
+            }
+            return match fs::symlink_metadata(path) {
+                Ok(_) => Err(ToolError::new(
+                    "recorded generated path exists while its owner root is missing; refusing removal",
+                )),
+                Err(path_error) if path_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(path_error) => Err(path_error.into()),
+            };
+        }
+        Err(error) => {
+            return Err(ToolError::new(format!(
+                "owned path root {} cannot be inspected: {error}",
+                owner_root.display()
+            )));
+        }
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(ToolError::new(format!(
+            "owned path root {} is not a regular directory",
+            owner_root.display()
+        )));
+    }
+    let canonical_root = fs::canonicalize(owner_root)?;
+    let relative = path.strip_prefix(owner_root).map_err(|_| {
+        ToolError::new("recorded generated paths escape their workspace or generated view")
+    })?;
+    let mut current = owner_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(ToolError::new(
+                "recorded generated paths contain an unsafe path component",
+            ));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ToolError::new(format!(
+                    "owned generated path {} has a symlinked ancestor; refusing removal",
+                    current.display()
+                )));
+            }
+            Ok(_) => {
+                if !fs::canonicalize(&current)?.starts_with(&canonical_root) {
+                    return Err(ToolError::new(
+                        "recorded generated paths escape their workspace or generated view",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !allow_missing {
+                    return Err(ToolError::new(format!(
+                        "recorded generated path {} is missing; inspect the ownership record manually",
+                        path.display()
+                    )));
+                }
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
 
-fn copy_file_atomically(
-    source: &Path,
-    destination: &Path,
-    label: &str,
-    private: bool,
-) -> ToolResult<()> {
-    let file_name = destination.file_name().ok_or_else(|| {
+fn validate_owned_worktree<R: CommandRunner>(
+    repository: &GitRepository,
+    workspace: &Path,
+    record: &OwnershipRecord,
+    runner: &mut R,
+    require_base_head: bool,
+) -> ToolResult<GitRepository> {
+    let canonical_workspace = fs::canonicalize(workspace).map_err(|error| {
         ToolError::new(format!(
-            "file rule `{label}` destination {} has no file name",
-            destination.display()
+            "cannot resolve recorded workspace {}: {error}",
+            workspace.display()
         ))
     })?;
-    let mut temporary_name = file_name.to_os_string();
-    temporary_name.push(".ddev-workspaces.tmp");
-    let temporary = destination.with_file_name(temporary_name);
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| {
-            ToolError::new(format!(
-                "file rule `{label}` temporary destination could not be created: {error}"
-            ))
-        })?;
-
-    let result: ToolResult<()> = (|| {
-        let mut input = fs::File::open(source).map_err(|error| {
-            ToolError::new(format!(
-                "file rule `{label}` source could not be opened: {error}"
-            ))
-        })?;
-        io::copy(&mut input, &mut output)
-            .map_err(|error| ToolError::new(format!("file rule `{label}` copy failed: {error}")))?;
-        output.sync_all().map_err(|error| {
-            ToolError::new(format!(
-                "file rule `{label}` copy could not be synced: {error}"
-            ))
-        })?;
-        if private {
-            set_private_permissions(&temporary)?;
-        }
-        // Publish the complete same-directory file without replacing an existing destination.
-        fs::hard_link(&temporary, destination).map_err(|error| {
-            ToolError::new(format!(
-                "file rule `{label}` destination {} could not be published: {error}",
-                destination.display()
-            ))
-        })?;
-        fs::remove_file(&temporary).map_err(|error| {
-            ToolError::new(format!(
-                "file rule `{label}` temporary destination could not be removed: {error}"
-            ))
-        })?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    let workspace_repository = GitRepository::discover(workspace, runner)?;
+    if workspace_repository.root != canonical_workspace {
+        return Err(ToolError::new(
+            "recorded workspace path does not resolve to its own Git worktree; refusing adoption",
+        ));
     }
-    result
+    if workspace_repository.common_dir != repository.common_dir {
+        return Err(ToolError::new(
+            "workspace path belongs to another Git common directory; refusing adoption",
+        ));
+    }
+    let expected_branch = format!("refs/heads/{}", record.branch);
+    let registered = repository.worktrees(runner)?.into_iter().find(|worktree| {
+        fs::canonicalize(&worktree.path)
+            .map(|path| path == canonical_workspace)
+            .unwrap_or(false)
+    });
+    if registered
+        .as_ref()
+        .and_then(|worktree| worktree.branch.as_deref())
+        != Some(expected_branch.as_str())
+    {
+        return Err(ToolError::new(
+            "recorded workspace path is not registered on the recorded branch; refusing adoption",
+        ));
+    }
+    if require_base_head && workspace_repository.current_head(runner)? != record.base_sha {
+        return Err(ToolError::new(
+            "workspace HEAD differs from the reserved base commit; inspect the retained record manually",
+        ));
+    }
+    Ok(workspace_repository)
 }
 
-fn run_one_command<R: CommandRunner>(
-    command: &CommandRule,
+fn owned_paths(prepared: &PreparedRuntime, link: &str) -> OwnedPaths {
+    OwnedPaths {
+        link: link.to_owned(),
+        view: prepared
+            .view
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        files: prepared
+            .files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        writable: prepared
+            .writable
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+    }
+}
+
+fn cleanup_adapter<R: CommandRunner>(
+    config: &ProjectConfig,
+    prepared: &PreparedRuntime,
     workspace: &Path,
     runner: &mut R,
 ) -> ToolResult<()> {
-    let cwd = config::safe_join(workspace, &command.cwd)?;
-    if !cwd.is_dir() {
+    match config.runtime.adapter.as_str() {
+        "laravel" => runtime::laravel::cleanup(prepared, workspace, runner),
+        "wordpress-component" => runtime::wordpress::cleanup(prepared),
+        adapter => Err(ToolError::new(format!(
+            "unsupported runtime adapter {adapter}"
+        ))),
+    }
+}
+
+fn require_locked_host<R: CommandRunner>(
+    host_root: &Path,
+    expected: &HostIdentity,
+    runner: &mut R,
+) -> ToolResult<()> {
+    let current = ddev::inspect_host(host_root, runner)?;
+    if !current.same_runtime_identity(expected) {
+        return Err(ToolError::new(
+            "DDEV host identity changed while waiting for the host lock; retry the operation",
+        ));
+    }
+    ddev::require_initialized(host_root, &current)
+}
+
+fn ensure_operation_not_interrupted(
+    signal_guard: &runtime::SignalGuard,
+    phase: &str,
+) -> ToolResult<()> {
+    if signal_guard.interrupted() {
         return Err(ToolError::new(format!(
-            "declared command `{}` cwd {} is not a directory",
-            command.label,
-            cwd.display()
+            "operation interrupted during {phase}; rerun the command to reconcile the ownership record"
         )));
     }
-    let mut request =
-        crate::command::CommandRequest::new(command.argv[0].clone(), command.argv[1..].to_vec())
+    Ok(())
+}
+
+fn run_provision<R: CommandRunner>(
+    config: &ProjectConfig,
+    runtime_root: &Path,
+    mode: DatabaseMode,
+    runner: &mut R,
+) -> ToolResult<()> {
+    for provision in &config.provision {
+        if provision.when != "always"
+            && provision.when
+                != match mode {
+                    DatabaseMode::Copy => "copy",
+                    DatabaseMode::Fresh => "fresh",
+                }
+        {
+            continue;
+        }
+        let cwd = config::safe_join(runtime_root, &provision.cwd)?;
+        let program = provision
+            .argv
+            .first()
+            .ok_or_else(|| ToolError::new("provision rule has an empty argv"))?
+            .clone();
+        let request = CommandRequest::new(program, provision.argv.iter().skip(1).cloned())
             .cwd(&cwd)
             .mutating();
-    if command.sensitive {
-        request = request.sensitive();
+        let request = if provision.sensitive {
+            request.sensitive()
+        } else {
+            request
+        };
+        let output = runner.run(&request)?;
+        if !output.success() {
+            return Err(ToolError::new(format!(
+                "provision rule {} failed; inspect the retained ownership record before retrying",
+                provision.label.as_deref().unwrap_or("unnamed")
+            )));
+        }
     }
+    Ok(())
+}
+
+fn run_checks(config: &ProjectConfig, runtime_root: &Path) -> ToolResult<()> {
+    for check in &config.checks {
+        let path = config::safe_join(runtime_root, &check.path)?;
+        match check.kind.as_str() {
+            "path-exists" if path.exists() => {}
+            "path-exists" => {
+                return Err(ToolError::new(format!(
+                    "readiness check {} requires path {}",
+                    check.label.as_deref().unwrap_or(&check.path),
+                    path.display()
+                )));
+            }
+            "env-key" => {
+                let key = check
+                    .key
+                    .as_deref()
+                    .ok_or_else(|| ToolError::new("environment readiness check has no key"))?;
+                let content = fs::read_to_string(&path).map_err(|error| {
+                    ToolError::new(format!(
+                        "readiness check {} could not read its named file: {error}",
+                        check.label.as_deref().unwrap_or(&check.path)
+                    ))
+                })?;
+                if !content.lines().any(|line| {
+                    line.split_once('=')
+                        .is_some_and(|(name, value)| name.trim() == key && !value.trim().is_empty())
+                }) {
+                    return Err(ToolError::new(format!(
+                        "readiness check {} requires non-empty environment key {}",
+                        check.label.as_deref().unwrap_or(&check.path),
+                        key
+                    )));
+                }
+            }
+            _ => {
+                return Err(ToolError::new(format!(
+                    "unsupported readiness check {}",
+                    check.label.as_deref().unwrap_or(&check.path)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_only_owned_changes<R: CommandRunner>(
+    repository: &GitRepository,
+    prepared: &PreparedRuntime,
+    runner: &mut R,
+) -> ToolResult<()> {
+    let request = CommandRequest::new(
+        "git",
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored=matching",
+            "--untracked-files=all",
+        ],
+    )
+    .cwd(&repository.root);
     let output = runner.run(&request)?;
-    if output.success() {
+    if !output.success() {
+        return Err(ToolError::new(
+            "could not inspect workspace changes after provisioning",
+        ));
+    }
+    let allowed = prepared
+        .files
+        .iter()
+        .chain(prepared.allowed_writable.iter())
+        .filter_map(|path| path.strip_prefix(&repository.root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect::<Vec<_>>();
+    let mut unexpected = Vec::new();
+    for entry in output.stdout.split('\0').filter(|entry| !entry.is_empty()) {
+        let path = entry.get(3..).unwrap_or(entry).replace('\\', "/");
+        if !allowed.iter().any(|candidate| {
+            path == *candidate
+                || path.starts_with(&format!("{candidate}/"))
+                || candidate.starts_with(&format!("{path}/"))
+        }) {
+            unexpected.push(path);
+        }
+    }
+    if unexpected.is_empty() {
         Ok(())
     } else {
         Err(ToolError::new(format!(
-            "declared command `{}` failed in {} with status {}; remediate it manually and rerun doctor",
-            command.label,
-            cwd.display(),
-            output.status
+            "workspace contains changes outside declared generated or writable paths: {}; inspect them manually",
+            unexpected.join(", ")
         )))
     }
 }
 
-fn run_one_check(check: &CheckRule, workspace: &Path) -> ToolResult<()> {
-    let path = config::safe_join(workspace, &check.path)?;
-    match check.kind.as_str() {
-        "path-exists" => {
-            if fs::symlink_metadata(&path).is_err() {
-                return Err(ToolError::new(format!(
-                    "readiness check `{}` requires path {}",
-                    check.label,
-                    path.display()
-                )));
-            }
-        }
-        "env-key" => {
-            let key = check.key.as_deref().ok_or_else(|| {
-                ToolError::new(format!("readiness check `{}` has no key", check.label))
-            })?;
-            let contents = fs::read_to_string(&path).map_err(|error| {
-                ToolError::new(format!(
-                    "readiness check `{}` could not read its named file: {error}",
-                    check.label
-                ))
-            })?;
-            let present = contents.lines().any(|line| {
-                let Some((candidate, value)) = line.split_once('=') else {
-                    return false;
-                };
-                candidate.trim() == key && !unquote(value.trim()).is_empty()
-            });
-            if !present {
-                return Err(ToolError::new(format!(
-                    "readiness check `{}` requires a non-empty named environment key",
-                    check.label
-                )));
-            }
-        }
-        kind => {
-            return Err(ToolError::new(format!(
-                "readiness check `{}` has unsupported kind `{kind}`",
-                check.label
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_local_file_sources(project_config: &ProjectConfig) -> ToolResult<()> {
-    for file in &project_config.files {
-        if let Some(source_env) = &file.source_env {
-            let _ = config::source_from_environment(source_env)?;
-        }
-    }
-    Ok(())
-}
-
-fn ensure_workspace_path(workspace_root: &Path, workspace: &Path) -> ToolResult<()> {
-    match fs::symlink_metadata(workspace) {
-        Ok(_) => {
-            return Err(ToolError::new(format!(
-                "workspace path {} already exists; refusing to overwrite it",
-                workspace.display()
-            )));
-        }
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(ToolError::new(format!(
-                "workspace path {} cannot be inspected: {error}",
-                workspace.display()
-            )));
-        }
-        Err(_) => {}
-    }
-    let root_parent = config::nearest_existing_parent(workspace_root);
-    let root = fs::canonicalize(&root_parent)?;
-    if root_parent != root {
-        return Err(ToolError::new(
-            "configured workspace root resolves through a symlink; refusing to create a non-canonical worktree",
-        ));
-    }
-    let parent = config::nearest_existing_parent(workspace);
-    let canonical_parent = fs::canonicalize(&parent)?;
-    if parent != canonical_parent {
-        return Err(ToolError::new(
-            "workspace path resolves through a symlink; refusing to create a non-canonical worktree",
-        ));
-    }
-    let parent = canonical_parent;
-    if !parent.starts_with(root) {
-        return Err(ToolError::new(
-            "workspace path escapes the configured ignored workspace root through a symlink",
-        ));
-    }
-    Ok(())
-}
-
-fn configured_ddev_app_root(
-    project_config: &ProjectConfig,
-    workspace: &Path,
-    workspace_name: &str,
-    resolved_source_site: Option<&ResolvedSourceSite>,
-) -> ToolResult<Option<PathBuf>> {
-    let Some(ddev_config) = &project_config.ddev else {
-        return Ok(None);
-    };
-    if ddev_config.source_site.is_some() {
-        let generated_root = if let Some(resolved) = resolved_source_site {
-            resolved.generated_root.clone()
-        } else {
-            config::source_generated_root()?
-        };
-        let mut relative = PathBuf::from(&project_config.project_id).join(workspace_name);
-        let app_relative = config::normalize_relative_path(&ddev_config.app_root);
-        if !app_relative.as_os_str().is_empty() {
-            relative.push(app_relative);
-        }
-        return Ok(Some(generated_root.join(relative)));
-    }
-    // The worktree does not exist yet during creation preflight. Configuration
-    // validation has already proved that app_root is repository-relative.
-    let app_relative = config::normalize_relative_path(&ddev_config.app_root);
-    if app_relative.as_os_str().is_empty() {
-        Ok(Some(workspace.to_path_buf()))
-    } else {
-        Ok(Some(workspace.join(app_relative)))
+fn record_failure(host_root: &Path, record: &mut OwnershipRecord, error: ToolError) -> ToolError {
+    let message = error.to_string();
+    record.status = WorkspaceStatus::Error;
+    record.error = Some(message.clone());
+    match state::update(host_root, record) {
+        Ok(_) => ToolError::new(format!(
+            "{message}\nOwnership record retained at {}; run list, doctor, retry create, or remove after inspection",
+            state::record_path(host_root, &record.resource_key).display()
+        )),
+        Err(update_error) => ToolError::new(format!(
+            "{message}\nAdditionally, ownership record could not be updated: {update_error}"
+        )),
     }
 }
 
-fn recorded_app_root(workspace: &Path, recorded: &str) -> ToolResult<PathBuf> {
-    let path = Path::new(recorded);
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        config::safe_join(workspace, recorded)
-    }
-}
-
-fn ensure_regular_file(path: &Path, label: &str) -> ToolResult<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        ToolError::new(format!(
-            "file rule `{label}` source {} is unavailable: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(ToolError::new(format!(
-            "file rule `{label}` source {} must be a regular non-symlink file",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn is_regular_file(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
-}
-
-fn set_private_permissions(path: &Path) -> ToolResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(path, permissions)?;
-    }
-    Ok(())
-}
-
-fn unquote(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .or_else(|| {
-            value
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
-        })
-        .unwrap_or(value)
-}
-
-fn print_source_diagnostics(diagnostics: &SourceDiagnostics) {
-    println!(
-        "Source: {}",
-        if diagnostics.ready() {
-            "READY"
-        } else {
-            "NOT READY"
-        }
-    );
-    for issue in &diagnostics.issues {
-        println!("- {issue}");
-    }
-    for warning in &diagnostics.warnings {
-        println!("Cleanup report: {warning}");
-    }
-}
-
-fn format_source_failure(diagnostics: &SourceDiagnostics) -> String {
-    let mut message = String::from("source verification failed");
-    for issue in &diagnostics.issues {
-        message.push_str("; ");
-        message.push_str(issue);
-    }
-    message
-}
-
-fn print_create_dry_run(
-    project_config: &ProjectConfig,
+#[allow(clippy::too_many_arguments)]
+fn print_create_plan(
+    config: &ProjectConfig,
+    identity: &HostIdentity,
+    name: &str,
+    key: &str,
     workspace: &Path,
     base: &git::BaseRevision,
-    ddev_name: &str,
-    source_only: bool,
+    mode: DatabaseMode,
+    database: &str,
 ) {
-    println!("Source: planned read-only verification");
+    println!("Repository: {}", config.project_id);
+    println!("Host: {} ({})", identity.project.name, identity.hostname);
+    println!("Workspace: {name}");
+    println!("Resource key: {key}");
+    println!("Base: {} @ {}", base.reference, base.sha);
+    println!("Worktree: {}", workspace.display());
     println!(
-        "Planned: git worktree add -b {} {} {}",
-        workspace
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace"),
-        workspace.display(),
-        base.sha
+        "URL: {}",
+        ddev::expected_url(&identity.hostname, key).unwrap_or_else(|_| "invalid".to_owned())
     );
-    for file in &project_config.files {
-        println!("Planned file rule: {} -> {}", file.label, file.destination);
-    }
-    for command in &project_config.commands {
-        if command.sensitive {
-            println!("Planned command: {} [sensitive]", command.label);
-        } else {
-            println!("Planned command: {} in {}", command.label, command.cwd);
-        }
-    }
-    if source_only {
-        println!("Runtime: skipped by --source-only");
-        println!("DDEV: skipped by --source-only");
-    } else if project_config.ddev.is_some() {
-        println!("Planned DDEV identity: {ddev_name}");
-        if let Some(source_site) = project_config
-            .ddev
-            .as_ref()
-            .and_then(|ddev| ddev.source_site.as_ref())
-        {
-            println!(
-                "Planned auto-discovered source DDEV site with repository at {}",
-                source_site.repository_path
-            );
-            println!("Planned generated DDEV root: ~/.ddev-workspaces/sites");
-            if source_site.clone_database {
-                println!("Planned database clone from source DDEV site");
-            }
-        }
-    } else {
-        println!("DDEV: skipped (not configured)");
-    }
-    println!(
-        "READY — dry run complete; no reservation, branch, path, file, or DDEV mutation performed"
-    );
+    println!("Database: {database} ({})", database_mode_label(mode));
+    println!("Adapter: {}", config.runtime.adapter);
+    println!("DRY RUN — no route, file, Git, database, or ownership mutation performed");
 }
 
-fn preserved_failure(error: ToolError, workspace: &Path, record_path: &Path) -> ToolError {
-    ToolError::new(format!(
-        "NOT READY — {error}\nOwnership record preserved at {}; workspace path {} was not rolled back. Run doctor, then remove only after its safety checks pass.",
-        record_path.display(),
-        workspace.display()
-    ))
+fn database_mode_label(mode: DatabaseMode) -> &'static str {
+    match mode {
+        DatabaseMode::Copy => "copy",
+        DatabaseMode::Fresh => "fresh",
+    }
 }
 
-fn require_removal_confirmation(name: &str, delete_data: bool, yes: bool) -> ToolResult<()> {
+fn require_confirmation(name: &str, yes: bool) -> ToolResult<()> {
     if yes {
         return Ok(());
     }
     if !io::stdin().is_terminal() {
-        return Err(ToolError::new(
-            "non-interactive removal requires `--yes`; no mutation was attempted",
-        ));
+        return Err(ToolError::new(format!(
+            "removing workspace {name} requires --yes in a non-interactive terminal"
+        )));
     }
-
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    prompt_for_removal(name, delete_data, &mut input, &mut output)
-}
-
-fn prompt_for_removal(
-    name: &str,
-    delete_data: bool,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> ToolResult<()> {
-    if delete_data {
-        write!(
-            output,
-            "Remove workspace `{name}` and permanently delete its DDEV data? [y/N]: "
-        )?;
-    } else {
-        write!(output, "Remove workspace `{name}`? [y/N]: ")?;
-    }
-    output.flush()?;
-
-    let mut response = String::new();
-    input.read_line(&mut response)?;
-    if response.trim().eq_ignore_ascii_case("y") || response.trim().eq_ignore_ascii_case("yes") {
+    print!("Remove workspace {name}? Type 'yes' to continue: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim() == "yes" {
         Ok(())
     } else {
-        Err(ToolError::new(
-            "removal cancelled; no mutation was attempted",
-        ))
+        Err(ToolError::new("removal cancelled"))
+    }
+}
+
+fn print_source_diagnostics(diagnostics: &SourceDiagnostics) {
+    for issue in &diagnostics.issues {
+        println!("Git: NOT READY — {issue}");
+    }
+    for warning in &diagnostics.warnings {
+        println!("Git: WARNING — {warning}");
+    }
+    if diagnostics.ready() {
+        println!("Git: READY");
+    }
+}
+
+fn format_source_failure(diagnostics: &SourceDiagnostics) -> String {
+    if diagnostics.issues.is_empty() {
+        "Git source diagnostics did not produce a ready result".to_owned()
+    } else {
+        format!("Git source is not ready: {}", diagnostics.issues.join("; "))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use super::*;
 
     #[test]
-    fn prompt_for_removal_accepts_yes() {
-        let mut input = Cursor::new("yes\n");
-        let mut output = Vec::new();
-
-        let result = prompt_for_removal("feature", false, &mut input, &mut output);
-
-        assert!(result.is_ok(), "confirmation failed: {result:?}");
+    fn database_names_are_safe_and_bounded() {
+        let name = database_name(&"a".repeat(52)).unwrap();
+        assert!(name.len() <= 60);
+        assert!(name.starts_with("dw_"));
     }
 
     #[test]
-    fn prompt_for_removal_warns_before_deleting_ddev_data() {
-        let mut input = Cursor::new("y\n");
-        let mut output = Vec::new();
-
-        prompt_for_removal("feature", true, &mut input, &mut output)
-            .expect("confirmation should succeed");
-
-        let prompt = String::from_utf8(output).expect("UTF-8 prompt");
-        assert!(prompt.contains("permanently delete its DDEV data"));
-    }
-
-    #[test]
-    fn prompt_for_removal_rejects_no() {
-        let mut input = Cursor::new("no\n");
-        let mut output = Vec::new();
-
-        let error = prompt_for_removal("feature", false, &mut input, &mut output)
-            .expect_err("confirmation should be cancelled");
-
-        assert_eq!(
-            error.to_string(),
-            "removal cancelled; no mutation was attempted"
-        );
-    }
-
-    #[test]
-    fn env_key_check_does_not_return_or_print_the_value() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join(".env");
-        fs::write(&path, "APP_KEY=secret-value\n").expect("env file");
-        let check = CheckRule {
-            label: "app key".to_owned(),
-            kind: "env-key".to_owned(),
-            path: ".env".to_owned(),
-            key: Some("APP_KEY".to_owned()),
-        };
-
-        run_one_check(&check, directory.path()).expect("key should be ready");
+    fn database_mode_labels_are_stable() {
+        assert_eq!(database_mode_label(DatabaseMode::Copy), "copy");
+        assert_eq!(database_mode_label(DatabaseMode::Fresh), "fresh");
     }
 }

@@ -63,6 +63,7 @@ pub struct CommandRequest {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     pub sensitive: bool,
+    pub redact_display: bool,
     pub mutating: bool,
 }
 
@@ -78,6 +79,7 @@ impl CommandRequest {
             cwd: None,
             env: Vec::new(),
             sensitive: false,
+            redact_display: false,
             mutating: false,
         }
     }
@@ -99,11 +101,17 @@ impl CommandRequest {
 
     pub fn sensitive(mut self) -> Self {
         self.sensitive = true;
+        self.redact_display = true;
+        self
+    }
+
+    pub fn redact(mut self) -> Self {
+        self.redact_display = true;
         self
     }
 
     pub fn display(&self) -> String {
-        if self.sensitive {
+        if self.sensitive || self.redact_display {
             format!("{} [sensitive command]", self.program)
         } else {
             let args = self

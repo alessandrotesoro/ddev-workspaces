@@ -255,7 +255,7 @@ impl GitRepository {
         }
         if self.branch_exists(branch, runner)? {
             return Err(ToolError::new(format!(
-                "branch `{branch}` already exists; v1 never adopts or resets an existing branch"
+                "branch `{branch}` already exists; the CLI never adopts or resets an existing branch"
             )));
         }
         Ok(())
@@ -289,79 +289,6 @@ impl GitRepository {
                 path.display()
             )))
         }
-    }
-
-    pub fn require_stage_zero_file<R: CommandRunner>(
-        &self,
-        path: &Path,
-        runner: &mut R,
-    ) -> ToolResult<()> {
-        let relative = path.strip_prefix(&self.root).map_err(|_| {
-            ToolError::new(format!(
-                "declared template {} is outside the Git worktree",
-                path.display()
-            ))
-        })?;
-        let relative = relative.to_str().ok_or_else(|| {
-            ToolError::new(format!(
-                "declared template {} cannot be represented as a Git path",
-                path.display()
-            ))
-        })?;
-        let output = run_git(
-            runner,
-            &self.root,
-            [
-                "ls-files".to_owned(),
-                "--stage".to_owned(),
-                "-z".to_owned(),
-                "--".to_owned(),
-                relative.to_owned(),
-            ],
-        )?;
-        let tracked = parse_tracked_paths(&output);
-        if tracked
-            .iter()
-            .any(|entry| entry.stage == 0 && entry.path == relative)
-        {
-            return Ok(());
-        }
-        Err(ToolError::new(format!(
-            "declared template {} must be a stage-zero tracked Git file; untracked templates are not accepted",
-            path.display()
-        )))
-    }
-
-    pub fn require_commit_regular_file<R: CommandRunner>(
-        &self,
-        commit: &str,
-        path: &str,
-        runner: &mut R,
-    ) -> ToolResult<()> {
-        let output = run_git(
-            runner,
-            &self.root,
-            ["ls-tree", "-z", "--full-tree", commit, "--", path],
-        )?;
-        let mut entries = output.split_terminator('\0');
-        let regular_file = entries.next().is_some_and(|entry| {
-            let Some((metadata, entry_path)) = entry.split_once('\t') else {
-                return false;
-            };
-            let mut fields = metadata.split_whitespace();
-            matches!(fields.next(), Some("100644" | "100755"))
-                && fields.next() == Some("blob")
-                && fields.next().is_some()
-                && fields.next().is_none()
-                && entry_path == path
-                && entries.next().is_none()
-        });
-        if regular_file {
-            return Ok(());
-        }
-        Err(ToolError::new(format!(
-            "declared template {path} must be a regular tracked Git file in base commit {commit}"
-        )))
     }
 
     pub fn remove_worktree<R: CommandRunner>(&self, path: &Path, runner: &mut R) -> ToolResult<()> {
@@ -677,7 +604,12 @@ impl GitRepository {
         let status = run_git_allow_failure(
             runner,
             worktree,
-            ["status", "--porcelain", "--untracked-files=normal"],
+            [
+                "status",
+                "--porcelain=v1",
+                "--ignored=matching",
+                "--untracked-files=all",
+            ],
         )?;
         if !status.success() {
             return Err(ToolError::new(format!(
@@ -970,28 +902,6 @@ mod tests {
             parse_submodule_issues("-0123456789012345678901234567890123456789 vendor/private\n");
 
         assert_eq!(issues, vec!["submodule vendor/private: uninitialized"]);
-    }
-
-    #[test]
-    fn template_stage_check_rejects_untracked_paths() {
-        let mut runner = FakeRunner {
-            responses: vec![CommandOutput {
-                status: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            }],
-        };
-        let repository = GitRepository {
-            root: PathBuf::from("/tmp/repo"),
-            common_dir: PathBuf::from("/tmp/repo/.git"),
-            main_worktree: PathBuf::from("/tmp/repo"),
-        };
-
-        let error = repository
-            .require_stage_zero_file(&repository.root.join(".env.example"), &mut runner)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("stage-zero tracked Git file"));
     }
 
     #[test]
