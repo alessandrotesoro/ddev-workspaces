@@ -2,39 +2,34 @@ mod support;
 
 use std::fs;
 
-use support::{init_repo, run_cli, stdout};
+use support::{init_repo, run_cli, stderr, stdout, write_laravel_config};
 
 #[test]
-fn doctor_reports_unknown_configuration_fields_without_mutation() {
+fn doctor_rejects_unknown_fields_without_creating_state() {
     let repository = init_repo();
     fs::write(
         repository.path().join(".ddev-workspaces.toml"),
-        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\nfuture = true\n",
+        "version = 2\nproject_id = 'fixture'\nworktree_root = '.ddev-workspaces/worktrees'\nfuture = true\n[runtime]\nadapter = 'laravel'\nhost = '.'\n",
     )
     .expect("configuration file");
+
+    let output = run_cli(repository.path(), &["doctor"]);
+    let text = stderr(&output);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text.contains("invalid configuration"));
+    assert!(!repository.path().join(".ddev-workspaces").exists());
+}
+
+#[test]
+fn v2_configuration_is_strict_and_requires_a_running_host_for_readiness() {
+    let repository = init_repo();
+    write_laravel_config(repository.path(), "fresh");
 
     let output = run_cli(repository.path(), &["doctor"]);
     let text = stdout(&output);
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(text.contains("Configuration: NOT READY"));
-    assert!(text.contains("unknown field"));
-    assert!(!repository.path().join(".worktrees").exists());
-}
-
-#[test]
-fn doctor_accepts_a_strict_minimal_configuration_when_workspace_root_is_ignored() {
-    let repository = init_repo();
-    fs::write(
-        repository.path().join(".ddev-workspaces.toml"),
-        "version = 1\nproject_id = 'fixture'\nworkspace_root = '.worktrees'\n",
-    )
-    .expect("configuration file");
-
-    let output = run_cli(repository.path(), &["doctor"]);
-    let text = stdout(&output);
-
-    assert!(output.status.success(), "{text}");
-    assert!(text.contains("Configuration: READY"));
-    assert!(text.ends_with("READY\n"));
+    assert!(text.contains("Configuration: READY"), "{text}");
+    assert!(text.contains("DDEV host: NOT READY"), "{text}");
 }
